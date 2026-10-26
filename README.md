@@ -4,11 +4,13 @@ This repository contains the implementation for tracking tennis court lines acro
 
 ## Requirements
 
-Ensure you have installed the required dependencies:
+Dependencies are managed with [uv](https://docs.astral.sh/uv/). From this directory:
 
 ```bash
-pip install -r requirements.txt
+uv sync
 ```
+
+That creates a `.venv` and installs NumPy, SciPy, OpenCV, and Matplotlib from `pyproject.toml` / `uv.lock`.
 
 ## Setup & Data Preparation
 
@@ -43,13 +45,13 @@ For each rally you want to evaluate, you need to extract the first frame (as `te
 
 ## Running the Tracking Pipeline
 
-Once the data is prepared, you can run the evaluation script:
+Once the data is prepared, run the evaluation script inside the environment (`uv run`, or after `source .venv/bin/activate`):
 
 ```bash
-python main1.py <path_to_refdir> <path_images_dir> <path_feature_dir> <path_output_dir>
+uv run python main1.py <path_to_refdir> <path_images_dir> <path_feature_dir> <path_output_dir>
 ```
 
 Example:
 ```bash
-python main1.py ref_tennis/ datasets/rally_04/images/ features/rally_04/ results/rally_04/
+uv run python main1.py ref_tennis/ datasets/rally_04/images/ features/rally_04/ results/rally_04/
 ```

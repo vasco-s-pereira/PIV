@@ -24,6 +24,7 @@ results_simplified/
 sanity_reports/
 
 # Dependencies and external repos
+.venv/
 TennisCourtDetector/
 models/
 

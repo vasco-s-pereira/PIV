@@ -1,0 +1,15 @@
+[project]
+name = "piv-tennis"
+version = "0.1.0"
+description = "Tennis court tracking via homography estimation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "opencv-python-headless",
+    "matplotlib",
+]
+
+[tool.uv]
+package = false
