@@ -30,20 +30,13 @@ This project relies on the [TennisCourtDetector](https://github.com/yastrebksv/T
 3. Download the [pretrained weights](https://drive.google.com/file/d/1f-Co64ehgq4uddcQm1aFBDtbnyZhQvgG/view) and save them as `TennisCourtDetector/models/model.pt` (this folder is gitignored).
 
 ### 3. Extract Reference Images and Keypoints
-For each rally you want to evaluate, you need to extract the first frame (as `templateimg.jpg`) and compute the initial 14 court keypoints (`court_base_templateimg.mat`).
+For each rally, copy its first frame to `templateimg.jpg` and detect the 14 court keypoints. `extract_reference.py` does both and writes `court_base_templateimg.mat` (`img_pts`, shape `(14, 2)`, same landmark order as `courtmodel.mat`):
 
-1. Extract the first frame of the rally and save it. For instance, save it as `templateimg.jpg`.
-2. Run the `TennisCourtDetector` inference on that image to extract the keypoints:
-   ```bash
-   cd TennisCourtDetector
-   uv run --project .. python infer_in_image.py \
-     --model_path models/model.pt \
-     --input_path ../templateimg.jpg \
-     --output_path ../templateimg_kps.jpg \
-     --use_homography --use_refine_kps
-   ```
-3. This writes an annotated image. Save the 14 keypoints as `court_base_templateimg.mat` with an `img_pts` array of shape `(N, 2)` (pixel positions in `templateimg.jpg`). 
-4. Place **both** `templateimg.jpg` and `court_base_templateimg.mat` into your reference directory (e.g., `ref_tennis/` or a rally-specific directory). The evaluation scripts will look for `court_base_*.mat` in either the `images_dir` or the `ref_dir`.
+```bash
+uv run python extract_reference.py datasets/rally_04 ref_tennis
+```
+
+That also writes `templateimg_kps.jpg` so you can check the points. If `refdir` has no `courtmodel.mat`, the script links the one in `ref_tennis/`. `part1` looks for `court_base_*.mat` in either the reference directory or the images directory.
 
 > **Note:** The universal physical dimensions of the ITF tennis court are provided in `ref_tennis/courtmodel.mat`. This file is already tracked in the repository and you do not need to generate it.
 
