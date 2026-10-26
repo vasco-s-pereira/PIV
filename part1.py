@@ -663,21 +663,185 @@ def _as_points(a):
     return a.T if a.shape[0] == 2 and a.shape[1] != 2 else a
 
 
-def load_court_anchor(refdir, images_dir=None):
+NET_LINE_IDX = 9            # courtmodel.mat lines[9] is the net (y = 0, not painted)
+ANCHOR_INLIER_PX = 4.0      # landmark reprojection inlier threshold for the anchor
+
+
+def _reprojection_error(H, src, dst):
+    """Per-point ||H src - dst|| (same units as dst). Invalid points -> inf."""
+    err = np.linalg.norm(apply_homography(H, src) - dst, axis=1)
+    err[~np.isfinite(err)] = np.inf
+    return err
+
+
+def _anchor_ransac(court_pts, img_pts, threshold=ANCHOR_INLIER_PX):
     """
-    H_ref_to_court (reference-image pixels -> court metres), by DLT on landmarks.
+    Exhaustive 4-point RANSAC for H (court metres -> image pixels).
+
+    With only 14 landmarks the C(14,4) = 1001 subsets are cheap to enumerate, so
+    this is deterministic: no random seed, no early stop. Each subset that is not
+    degenerate is fitted with the DLT and scored by the number of landmarks whose
+    reprojection error (in image pixels) is under `threshold`. Rejects a single
+    mislocated detector keypoint that a plain all-points DLT would smear over H.
+
+    Returns a boolean inlier mask over the landmarks (all True if nothing scores).
+    """
+    n = len(court_pts)
+    best_mask, best_n, best_cost = None, 0, np.inf
+    for idx in combinations(range(n), 4):
+        idx = list(idx)
+        if is_sample_degenerate(court_pts[idx], img_pts[idx]):
+            continue
+        H = dlt_homography(court_pts[idx], img_pts[idx])
+        if not is_valid_homography(H):
+            continue
+        err = _reprojection_error(H, court_pts, img_pts)
+        mask = err < threshold
+        n_in = int(mask.sum())
+        cost = float(err[mask].sum())
+        if n_in > best_n or (n_in == best_n and cost < best_cost):
+            best_mask, best_n, best_cost = mask, n_in, cost
+    if best_mask is None or best_n < 4:
+        return np.ones(n, dtype=bool)
+    return best_mask
+
+
+def _refine_anchor_landmarks(H0, court_pts, img_pts):
+    """LM on the 8 DoF of H (court -> image), minimising landmark reprojection
+    error in pixels. Kept only if the RMS improves."""
+    if len(court_pts) < 4 or abs(H0[2, 2]) < 1e-10:
+        return H0
+    H0 = normalize_scale(H0)
+
+    def residuals(p):
+        H = np.append(p, 1.0).reshape(3, 3)
+        r = (apply_homography(H, court_pts) - img_pts).ravel()
+        r[~np.isfinite(r)] = 1e3
+        return r
+
+    try:
+        res = least_squares(residuals, H0.ravel()[:8], method="lm", max_nfev=200)
+    except Exception:
+        return H0
+    H = np.append(res.x, 1.0).reshape(3, 3)
+    if not is_valid_homography(H):
+        return H0
+    before = np.sqrt(np.mean(_reprojection_error(H0, court_pts, img_pts) ** 2))
+    after = np.sqrt(np.mean(_reprojection_error(H, court_pts, img_pts) ** 2))
+    return H if after < before else H0
+
+
+def _sample_segments(lines, step_m=0.05):
+    """Concatenate all painted line segments into one (M, 2) array of metre
+    points spaced ~step_m apart (pure numpy, so part1 stays cv2-free)."""
+    chunks = []
+    for seg in np.asarray(lines, dtype=np.float64).reshape(-1, 2, 2):
+        p0, p1 = seg[0], seg[1]
+        length = float(np.linalg.norm(p1 - p0))
+        n = max(2, int(np.ceil(length / max(step_m, 1e-6))) + 1)
+        t = np.linspace(0.0, 1.0, n)[:, None]
+        chunks.append(p0[None, :] + t * (p1 - p0)[None, :])
+    return np.vstack(chunks) if chunks else np.zeros((0, 2))
+
+
+def _median_line_distance(H, samples_m, tree, size):
+    """Median distance (px) from the projected painted lines to the nearest
+    detected white-line pixel, over samples that land inside the frame."""
+    if tree is None or len(samples_m) == 0:
+        return np.nan
+    proj = apply_homography(H, samples_m)
+    inb = np.isfinite(proj).all(axis=1)
+    if size is not None:
+        w, h = size
+        inb &= (proj[:, 0] >= 0) & (proj[:, 0] < w) & (proj[:, 1] >= 0) & (proj[:, 1] < h)
+    if not inb.any():
+        return np.nan
+    dist, _ = tree.query(proj[inb])
+    return float(np.median(dist))
+
+
+def _refine_anchor_lines(H0, court_pts, img_pts, samples_m, line_px, size):
+    """
+    Robust refinement of H (court -> image) against the detected white-line
+    pixels. The residual stacks the landmark reprojection errors with the
+    distance from each projected line sample to its nearest white pixel
+    (re-associated on every evaluation via a KD-tree). A Huber loss keeps stray
+    white pixels (players, logos, text) from pulling the fit.
+
+    Returns (H, tree) and leaves H0 unchanged if the median line distance does
+    not improve.
+    """
+    if line_px is None or len(line_px) < 10 or len(samples_m) == 0:
+        return H0, None
+    tree = cKDTree(np.asarray(line_px, dtype=np.float64))
+    w = h = None
+    if size is not None:
+        w, h = float(size[0]), float(size[1])
+
+    n_land = 2 * len(court_pts)
+    # balance: land residuals (n_land components) vs the many line samples
+    lam = np.sqrt(n_land / max(1, len(samples_m)))
+
+    def residuals(p):
+        H = np.append(p, 1.0).reshape(3, 3)
+        land = (apply_homography(H, court_pts) - img_pts).ravel()
+        land[~np.isfinite(land)] = 1e3
+        proj = apply_homography(H, samples_m)
+        d = np.zeros(len(samples_m))
+        inb = np.isfinite(proj).all(axis=1)
+        if size is not None:
+            inb &= (proj[:, 0] >= 0) & (proj[:, 0] < w) & (proj[:, 1] >= 0) & (proj[:, 1] < h)
+        if inb.any():
+            dist, _ = tree.query(proj[inb])
+            d[inb] = dist
+        return np.concatenate([land, lam * d])
+
+    try:
+        res = least_squares(residuals, normalize_scale(H0).ravel()[:8],
+                            method="trf", loss="huber", f_scale=2.0, max_nfev=300)
+    except Exception:
+        return H0, tree
+    H = np.append(res.x, 1.0).reshape(3, 3)
+    if not is_valid_homography(H):
+        return H0, tree
+    before = _median_line_distance(H0, samples_m, tree, size)
+    after = _median_line_distance(H, samples_m, tree, size)
+    if np.isnan(after) or (np.isfinite(before) and after > before):
+        return H0, tree
+    return H, tree
+
+
+def load_court_anchor(refdir, images_dir=None, out_dir=None):
+    """
+    Build the one absolute anchor of the sequence: H_ref_to_court, the
+    homography from reference-image pixels to court metres (so Hc = anchor @ H).
+
+    The fit is done in the court -> image direction, which keeps every residual
+    in image pixels (mixing pixels and metres in one least-squares is meaningless):
+        1. exhaustive 4-point RANSAC over the landmarks (rejects a bad keypoint);
+        2. LM refinement of H on the landmark inliers;
+        3. if the reference carries detected white-line pixels (`line_px`), a
+           robust refinement that snaps the projected court lines onto them.
 
     Expects in refdir (or, for the landmark file, in the images directory):
-        courtmodel.mat    {"pts": (N,2) metres, "names": ...}
-        court_base*.mat   {"img_pts" (or "points"): (N,2) pixel positions of the same landmarks
-                           in templateimg.jpg}; an optional "court_pts" key
-                           overrides the model points (for a subset of landmarks)
-    Raises if the anchor cannot be built: a silent identity would make Hc garbage.
+        courtmodel.mat    {"pts": (N,2) metres, "names", "lines": (L,2,2) metres}
+        court_base*.mat   {"img_pts": (N,2) pixels of the same landmarks in
+                           templateimg.jpg}; optional "line_px" (M,2), "size" (2,),
+                           and "court_pts" (overrides the model points).
+
+    Writes anchor_report.json to out_dir (if given) and raises if no valid anchor
+    can be built: a silent identity would make Hc garbage.
     """
     cm_path = os.path.join(refdir, "courtmodel.mat")
     if not os.path.exists(cm_path):
         raise FileNotFoundError(f"{cm_path} not found")
-    court_pts = _as_points(sio.loadmat(cm_path)["pts"])
+    cm = sio.loadmat(cm_path)
+    court_pts = _as_points(cm["pts"])
+    lines = None
+    if "lines" in cm:
+        lines = np.asarray(cm["lines"], dtype=np.float64).reshape(-1, 2, 2)
+        if len(lines) > NET_LINE_IDX:
+            lines = np.delete(lines, NET_LINE_IDX, axis=0)
 
     base_files = []
     for d in (refdir, images_dir):                    # README: either directory
@@ -694,6 +858,11 @@ def load_court_anchor(refdir, images_dir=None):
     img_pts = _as_points(base[key])
     if "court_pts" in base:
         court_pts = _as_points(base["court_pts"])
+    line_px = _as_points(base["line_px"]) if "line_px" in base and np.size(base["line_px"]) else None
+    size = None
+    if "size" in base and np.size(base["size"]) >= 2:
+        s = np.asarray(base["size"], dtype=np.float64).ravel()
+        size = (float(s[0]), float(s[1]))
 
     if img_pts.shape != court_pts.shape:
         raise ValueError(f"Landmark count mismatch: image {img_pts.shape} vs court {court_pts.shape}")
@@ -704,14 +873,62 @@ def load_court_anchor(refdir, images_dir=None):
     if len(img_pts) < 4:
         raise ValueError(f"Need >= 4 valid landmark pairs, got {len(img_pts)}")
 
-    H = dlt_homography(img_pts, court_pts)
-    if not is_valid_homography(H):
+    # 1. exhaustive RANSAC (court -> image), then DLT + LM on the inliers
+    inl = _anchor_ransac(court_pts, img_pts)
+    H_ci = dlt_homography(court_pts[inl], img_pts[inl])
+    if not is_valid_homography(H_ci):
         raise ValueError("Court anchor DLT produced a degenerate homography")
+    H_ci = _refine_anchor_landmarks(H_ci, court_pts[inl], img_pts[inl])
 
-    rms_cm = 100 * np.sqrt(np.mean(np.sum((apply_homography(H, img_pts) - court_pts) ** 2, axis=1)))
-    print(f"[part1] Anchor from {os.path.basename(base_files[0])}: "
-          f"{len(img_pts)} landmarks, RMS residual {rms_cm:.1f} cm")
-    return H
+    def land_stats(H):
+        err = _reprojection_error(H, court_pts[inl], img_pts[inl])
+        rms_px = float(np.sqrt(np.mean(err ** 2)))
+        court_err = _reprojection_error(np.linalg.inv(H), img_pts[inl], court_pts[inl])
+        rms_cm = 100.0 * float(np.sqrt(np.mean(court_err ** 2)))
+        return rms_px, rms_cm
+
+    rms_px_land, rms_cm_land = land_stats(H_ci)
+
+    # 2. optional white-line refinement
+    samples_m = _sample_segments(lines) if lines is not None else np.zeros((0, 2))
+    tree = None
+    median_before = median_after = np.nan
+    H_final = H_ci
+    if line_px is not None and len(samples_m):
+        tree = cKDTree(np.asarray(line_px, dtype=np.float64))
+        median_before = _median_line_distance(H_ci, samples_m, tree, size)
+        H_final, _ = _refine_anchor_lines(H_ci, court_pts, img_pts, samples_m, line_px, size)
+        median_after = _median_line_distance(H_final, samples_m, tree, size)
+
+    rms_px_fin, rms_cm_fin = land_stats(H_final)
+    report = {
+        "source": os.path.basename(base_files[0]),
+        "landmarks_valid": int(len(court_pts)),
+        "landmark_inliers": int(inl.sum()),
+        "line_px_count": int(len(line_px)) if line_px is not None else 0,
+        "landmark_rms_px_before_lines": rms_px_land,
+        "landmark_rms_cm_before_lines": rms_cm_land,
+        "landmark_rms_px_after_lines": rms_px_fin,
+        "landmark_rms_cm_after_lines": rms_cm_fin,
+        "line_median_px_before": median_before,
+        "line_median_px_after": median_after,
+    }
+    print(f"[part1] Anchor from {report['source']}: "
+          f"{report['landmark_inliers']}/{report['landmarks_valid']} inlier landmarks, "
+          f"RMS {rms_px_fin:.2f} px / {rms_cm_fin:.1f} cm")
+    if line_px is not None and np.isfinite(median_after):
+        print(f"[part1]   white-line median distance {median_before:.2f} -> {median_after:.2f} px "
+              f"({report['line_px_count']} line pixels)")
+    if out_dir:
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            with open(os.path.join(out_dir, "anchor_report.json"), "w") as f:
+                json.dump({k: (None if isinstance(v, float) and np.isnan(v) else v)
+                           for k, v in report.items()}, f, indent=2)
+        except OSError as e:
+            print(f"[part1] could not write anchor_report.json: {e}")
+
+    return np.linalg.inv(H_final)
 
 
 # ------------------------------------------------------------------------------
@@ -765,7 +982,7 @@ def part1(path1, path2, path3, path4, strategy="hybrid"):
     # output; the brief requires H and Hc for every frame. H is still computed and Hc
     # is written as NaN: explicitly invalid rather than silently wrong. (membro 3 decides.)
     try:
-        H_ref_to_court = load_court_anchor(refdir, images_dir)
+        H_ref_to_court = load_court_anchor(refdir, images_dir, out_dir)
     except (FileNotFoundError, KeyError, ValueError) as e:
         print(f"[part1] WARNING: no court anchor ({e})\n"
               "        H is still computed for every frame; Hc is written as NaN.")

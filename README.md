@@ -61,3 +61,45 @@ for r in rally_01 rally_02 rally_03 rally_04; do
   uv run python main1.py ref/$r datasets/$r features/$r results/$r
 done
 ```
+
+`extract_reference.py` now also saves, in `court_base_templateimg.mat`, the raw
+detector keypoints (`img_pts`), the detector-snapped points (`img_pts_snapped`),
+the white court-line pixels (`line_px`) and the image `size`. The anchor in
+`part1.py` fits the metric court homography in the court-to-image direction with
+an exhaustive 4-point RANSAC over the landmarks (which rejects a mislocated
+keypoint), LM refinement, and a final robust snap onto `line_px`; it writes
+`anchor_report.json` to the output directory. If no court landmark file is found,
+`Hc` is written as all-`NaN` (an explicitly invalid metric homography is safer
+than a silently wrong one), while `H` is still produced for every frame.
+
+## Court Model Metrics and Overlay Video (Appendix A)
+
+These scripts evaluate and visualise the metric court anchor `Hc`.
+
+Hand-mark the doubles-court corners on a few frames (independent ground truth for
+the warped-court IoU; uses a matplotlib window):
+```bash
+uv run python tests/annotate_court.py --images datasets/rally_04 --ref ref/rally_04 --n 5
+```
+
+Compute the court metrics (line reprojection error, metric residual in cm, and
+warped-court IoU where annotations exist); writes a per-frame CSV, `summary.json`
+and plots:
+```bash
+uv run python tests/evaluate_court.py \
+  --results results/rally_04 --images datasets/rally_04 \
+  --ref ref/rally_04 --out court_reports/rally_04
+```
+
+Render the ITF court model over every frame (green = direct, yellow = sequential,
+red = fallback), with an optional top-view minimap inset:
+```bash
+uv run python tests/make_overlay_video.py \
+  --results results/rally_04 --images datasets/rally_04 --ref ref/rally_04 \
+  --out court_reports/rally_04/overlay.mp4 --reports court_reports/rally_04 --minimap
+```
+
+Unit tests for the anchor (synthetic RANSAC/refinement, no-cv2 check):
+```bash
+uv run python tests/test_court.py
+```
