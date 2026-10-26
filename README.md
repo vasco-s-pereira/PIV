@@ -33,10 +33,10 @@ This project relies on the [TennisCourtDetector](https://github.com/yastrebksv/T
 For each rally, copy its first frame to `templateimg.jpg` and detect the 14 court keypoints. `extract_reference.py` does both and writes `court_base_templateimg.mat` (`img_pts`, shape `(14, 2)`, same landmark order as `courtmodel.mat`):
 
 ```bash
-uv run python extract_reference.py datasets/rally_04 ref_tennis
+uv run python extract_reference.py datasets/rally_04 ref/rally_04
 ```
 
-That also writes `templateimg_kps.jpg` so you can check the points. If `refdir` has no `courtmodel.mat`, the script links the one in `ref_tennis/`. `part1` looks for `court_base_*.mat` in either the reference directory or the images directory.
+Use one reference directory per rally (`ref/rally_01`, ..., `ref/rally_04`): the keypoints belong to that rally's first frame. That also writes `templateimg_kps.jpg` so you can check the points. If `refdir` has no `courtmodel.mat`, the script links the one in `ref_tennis/`. `part1` looks for `court_base_*.mat` in the reference directory first, then in the images directory, and uses the first one found.
 
 > **Note:** The universal physical dimensions of the ITF tennis court are provided in `ref_tennis/courtmodel.mat`. This file is already tracked in the repository and you do not need to generate it.
 
@@ -50,5 +50,13 @@ uv run python main1.py <path_to_refdir> <path_images_dir> <path_feature_dir> <pa
 
 Example:
 ```bash
-uv run python main1.py ref_tennis/ datasets/rally_04/images/ features/rally_04/ results/rally_04/
+uv run python main1.py ref/rally_04 datasets/rally_04 features/rally_04 results/rally_04
+```
+
+All rallies:
+```bash
+for r in rally_01 rally_02 rally_03 rally_04; do
+  uv run python extract_reference.py datasets/$r ref/$r
+  uv run python main1.py ref/$r datasets/$r features/$r results/$r
+done
 ```
