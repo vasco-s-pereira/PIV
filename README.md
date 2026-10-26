@@ -48,7 +48,10 @@ Once the data is prepared, run the evaluation script inside the environment (`uv
 uv run python main1.py <path_to_refdir> <path_images_dir> <path_feature_dir> <path_output_dir>
 ```
 
-Example:
+Frames sit directly in `datasets/rally_XX/`, and each rally has its own reference under `ref/rally_XX/`. For every rally:
+
 ```bash
-uv run python main1.py ref_tennis/ datasets/rally_04/images/ features/rally_04/ results/rally_04/
+for n in 01 02 03 04; do
+  uv run python main1.py ref/rally_$n datasets/rally_$n features/rally_$n results/rally_$n
+done
 ```
