@@ -20,7 +20,13 @@ Tracking strategy (hybrid with re-anchoring):
                    camera is far from the reference)
     * if both work, the direct estimate re-anchors the track unless it
       disagrees wildly with the sequential one (repetitive-line mismatch)
-    * if neither works (cut, close-up, crowd) the last valid H is propagated
+    * cuts are detected by continuity: frame i matches frame i-1 far worse than usual.
+      After a cut the track is "lost": no composition across it, and frames are written
+      with NaN H / Hc (method "no_court" in tracking_log.json) until a re-anchor: a strong
+      direct estimate, consistent with a pan-tilt-zoom of the reference camera
+      (rotation_residual), confirmed by the next frame. Close-ups, crowd shots and other
+      cameras (whose matches land on the stands) never pass that test.
+    * a frame with no acceptable estimate while tracking is also NaN ("no_estimate")
 """
 
 import os
@@ -54,6 +60,13 @@ GUIDED_RADIUS = 3.0         # px: window of the 2nd matching pass, around the pa
                             # Keep it below RANSAC_THRESH: at 4 px, near-miss wrong matches
                             # (3-3.5 px off) got in as inliers and biased 2 frames by ~6 px
 OVERLAY_SAMPLES = 40        # frames used to find the scoreboard / logos fixed on screen
+CUT_RATIO = 0.25            # cut: inliers to the previous frame below this fraction of the
+CUT_WINDOW = 15             #      median over the last CUT_WINDOW tracked frames
+CUT_MIN_HISTORY = 5         #      (needs this many tracked frames before it can fire)
+REANCHOR_FRAC = 0.4         # re-anchor after a cut: direct inliers >= this x median while tracking
+                            # (rallies 01-04: tracking >= 550, close-ups / other cameras <= 265)
+ROT_MAX = 0.03              # re-anchor: max rotation-consistency residual (tracking p99 0.014)
+CONFIRM_PX = 10.0           # re-anchor: two consecutive candidates must agree within this
 
 
 # ------------------------------------------------------------------------------
@@ -736,6 +749,36 @@ def estimate_pair(cur, ref, extent, min_inliers):
     return H, int(inl.sum())
 
 
+def is_cut(n_cons, history):
+    """A cut (or any break in continuity): the previous frame matches far worse than usual."""
+    if len(history) < CUT_MIN_HISTORY:
+        return False
+    return n_cons < CUT_RATIO * np.median(history[-CUT_WINDOW:])
+
+
+def rotation_residual(H, w, h):
+    """
+    How far H is from a homography a pan-tilt-zoom camera can produce, H ~ K_r R K_i^-1
+    (same centre, square pixels, principal point at the image centre, unknown focal
+    lengths f_r, f_i). With M = K_r^-1 H K_i, M^T M must be a multiple of I; we fit
+    f_r, f_i and return the residual. A different camera position gives H not of this
+    form, even when it is temporally consistent (matches on the stands of another view).
+    """
+    c = np.array([w / 2.0, h / 2.0])
+    K = lambda f: np.array([[f, 0, c[0]], [0, f, c[1]], [0, 0, 1.0]])
+
+    def res(lf):
+        fr, fi = np.exp(lf)
+        M = np.linalg.solve(K(fr), H @ K(fi))
+        G = M.T @ M
+        G = 3.0 * G / np.trace(G)
+        return (G - np.eye(3))[np.triu_indices(3)]
+
+    best = min((least_squares(res, np.log([f0, f0]), bounds=(np.log(0.15 * w), np.log(15.0 * w)))
+                for f0 in (0.6 * w, 1.2 * w, 2.4 * w)), key=lambda r: r.cost)
+    return float(np.sqrt(2.0 * best.cost))
+
+
 def disagreement(Ha, Hb, w, h):
     """Mean distance (reference pixels) between two homographies on 5 frame points."""
     g = np.array([[0, 0], [w, 0], [w, h], [0, h], [w / 2, h / 2]], dtype=np.float64)
@@ -805,9 +848,13 @@ def part1(path1, path2, path3, path4, strategy="hybrid"):
               f"removed, {len(ref[0])} left")
     geometry = frame_geometry(ref[0], size) if ref[0] is not None else None
 
-    prev = None                       # features of the last frame with a valid H
+    to_court = lambda H: H_ref_to_court @ H if H_ref_to_court is not None else np.full((3, 3), np.nan)
+    prev, prev_idx = None, -1         # features (and index) of the last frame with a valid H
     H_prev = np.eye(3)                # its H
-    last_valid_H = np.eye(3)
+    last = None                       # features of the previous frame, valid H or not
+    lost = False                      # after a cut, until a confirmed re-anchor
+    pending = None                    # re-anchor candidate (idx, num_str, H, n) awaiting confirmation
+    n_cons_hist, n_dir_hist = [], []  # inlier counts while tracking (cut / re-anchor thresholds)
     log = []
 
     for idx, (num, num_str, name) in enumerate(frames):
@@ -819,27 +866,59 @@ def part1(path1, path2, path3, path4, strategy="hybrid"):
             geometry = frame_geometry(ref[0])
             print(f"[part1] reference initialised from frame {num_str}")
 
-        method, n_in, H = "fallback", 0, None
+        method, n_in, H, reason = "no_court", 0, None, "no_features"
+        H_dir, n_dir, n_cons = None, 0, 0
 
         if has_feat and ref[0] is not None:
             w, h, extent = geometry
 
-            # --- sequential: last good frame -> current, composed with its H
-            H_seq = None
-            if prev is not None:
-                H_rel, n_seq = estimate_pair(cur, prev, extent, MIN_INLIERS_SEQ)
-                if H_rel is not None:
-                    cand = normalize_scale(H_prev @ H_rel)
-                    if is_plausible(cand, w, h):
-                        H_seq = cand
+            # --- continuity with the previous frame: a cut breaks it
+            H_cons = None
+            if last is not None:
+                H_cons, n_cons = estimate_pair(cur, last, extent, MIN_INLIERS_SEQ)
+            if not lost and last is not None and is_cut(n_cons, n_cons_hist):
+                lost, prev, pending = True, None, None
+                print(f"[part1] cut at frame {num_str} ({n_cons} inliers to the previous frame, "
+                      f"median {np.median(n_cons_hist[-CUT_WINDOW:]):.0f})")
 
             # --- direct: current -> reference
             H_dir, n_dir = estimate_pair(cur, ref, extent, MIN_INLIERS_DIRECT)
             if H_dir is not None and not is_plausible(H_dir, w, h):
                 H_dir = None
 
+            if lost:
+                # --- re-anchor: a strong, rotation-consistent direct estimate, confirmed
+                # by the next frame through the frame-to-frame H. Never by composition.
+                ok = (H_dir is not None
+                      and n_dir >= REANCHOR_FRAC * np.median(n_dir_hist or [0])
+                      and rotation_residual(H_dir, w, h) <= ROT_MAX)
+                if (ok and pending is not None and pending[0] == idx - 1 and H_cons is not None
+                        and disagreement(H_dir, normalize_scale(pending[2] @ H_cons), w, h) <= CONFIRM_PX):
+                    _, p_str, p_H, p_n = pending
+                    save_homography(out_dir, p_str, p_H, to_court(p_H))
+                    log[-1] = {"frame": log[-1]["frame"], "method": "reanchor", "inliers": p_n}
+                    lost, pending = False, None
+                    H, method, n_in = H_dir, "reanchor", n_dir
+                    print(f"[part1] re-anchored at frame {p_str} ({p_n} inliers)")
+                else:
+                    pending = (idx, num_str, H_dir, n_dir) if ok else None
+                    reason = "cut"
+            else:
+                # --- sequential: last good frame -> current, composed with its H
+                H_seq = None
+                if prev is not None:
+                    H_rel, n_seq = ((H_cons, n_cons) if prev_idx == idx - 1
+                                    else estimate_pair(cur, prev, extent, MIN_INLIERS_SEQ))
+                    if H_rel is not None:
+                        cand = normalize_scale(H_prev @ H_rel)
+                        if is_plausible(cand, w, h):
+                            H_seq = cand
+                reason = "no_estimate"
+
             # --- choose based on strategy
-            if strategy == "direct":
+            if lost or method == "reanchor":
+                pass
+            elif strategy == "direct":
                 if H_dir is not None:
                     H, method, n_in = H_dir, "direct", n_dir
             elif strategy == "sequential":
@@ -859,15 +938,20 @@ def part1(path1, path2, path3, path4, strategy="hybrid"):
                 elif H_seq is not None:
                     H, method, n_in = H_seq, "sequential", n_seq
 
-        if H is None:                                     # cut / close-up / crowd
-            H = last_valid_H.copy()
+        if H is None:                                     # cut / close-up / crowd / other camera
+            H = np.full((3, 3), np.nan)                   # explicitly "no valid transform"
+            entry = {"frame": num, "method": "no_court", "inliers": 0, "reason": reason}
         else:
-            last_valid_H = H.copy()
-            prev, H_prev = cur, H.copy()
+            prev, prev_idx, H_prev = cur, idx, H.copy()
+            if n_cons > 0:
+                n_cons_hist.append(n_cons)
+            if H_dir is not None:
+                n_dir_hist.append(n_dir)
+            entry = {"frame": num, "method": method, "inliers": n_in}
+        last = cur if has_feat else None
 
-        Hc = H_ref_to_court @ H if H_ref_to_court is not None else np.full((3, 3), np.nan)
-        save_homography(out_dir, num_str, H, Hc)
-        log.append({"frame": num, "method": method, "inliers": n_in})
+        save_homography(out_dir, num_str, H, to_court(H))
+        log.append(entry)
 
         if (idx + 1) % 50 == 0 or idx + 1 == len(frames):
             print(f"[part1] {idx + 1}/{len(frames)}  frame {num_str}: {method} ({n_in} inliers)")
@@ -875,7 +959,8 @@ def part1(path1, path2, path3, path4, strategy="hybrid"):
     with open(os.path.join(out_dir, "tracking_log.json"), "w") as f:
         json.dump(log, f)
 
-    counts = {m: sum(1 for e in log if e["method"] == m) for m in ("direct", "sequential", "fallback")}
+    counts = {m: sum(1 for e in log if e["method"] == m)
+              for m in ("direct", "sequential", "reanchor", "no_court")}
     print(f"[part1] done: {counts}  -> {out_dir}")
 
     missing = missing_outputs(out_dir, frames)
