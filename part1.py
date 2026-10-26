@@ -1,676 +1,896 @@
 """
-part1.py - Planar Tracking and Homography Estimation for PIV Project (Part 1).
+part1.py - Planar tracking and homography estimation (PIV Project, Part 1).
 
-RESTRICTIONS COMPLIANCE:
-- NO OpenCV (cv2) imported or used.
-- Uses only NumPy and SciPy.
-- Implements Hartley-normalized DLT from scratch.
-- Implements RANSAC outlier rejection and homography estimation from scratch.
-- Implements SIFT descriptor matching with Lowe's ratio test and mutual consistency via scipy.spatial.cKDTree.
-- Computes:
-    * H: 3x3 homography mapping frame NNNN pixels to reference image pixels (templateimg.jpg).
-    * Hc: 3x3 homography mapping frame NNNN pixels to metric court coordinates (in meters).
+Only numpy / scipy are used (no cv2). DLT and RANSAC are written out by hand.
+
+Outputs, one file per frame:  homography_NNNN.mat  ->  {"H": H, "Hc": Hc}
+    H  : frame NNNN -> reference image (templateimg.jpg), pixels
+    Hc : frame NNNN -> court model, metres      (Hc = H_ref_to_court @ H)
+plus tracking_log.json (method used per frame, so cuts can be checked later).
+
+Feature matching and file I/O (section 5) [membro 2]:
+    * RootSIFT descriptors, ratio test + mutual check by exact brute force
+    * scoreboard / channel-logo filter: keypoints that stay put while the camera moves
+    * two-pass matching: global -> H -> guided matching around that same H
+
+Tracking strategy (hybrid with re-anchoring):
+    * sequential : match frame i to the last good frame, compose with its H
+                   (small baseline, many matches, but drifts)
+    * direct     : match frame i to the reference (no drift, fails when the
+                   camera is far from the reference)
+    * if both work, the direct estimate re-anchors the track unless it
+      disagrees wildly with the sequential one (repetitive-line mismatch)
+    * if neither works (cut, close-up, crowd) the last valid H is propagated
 """
 
 import os
 import re
 import glob
+import json
+import struct
+from itertools import combinations
+
 import numpy as np
 import scipy.io as sio
 from scipy.spatial import cKDTree
 from scipy.optimize import least_squares
+from scipy.ndimage import binary_closing, binary_dilation
 
 
-# ==============================================================================
-# 1. Direct Linear Transformation (DLT) with Hartley Normalization
-# ==============================================================================
+# ------------------------------------------------------------------------------
+# Tunable parameters
+# ------------------------------------------------------------------------------
+RATIO_THRESH = 0.8          # Lowe ratio test (on RootSIFT; 0.8 tested on the synthetic set)
+RANSAC_THRESH = 3.5         # inlier threshold (px, symmetric transfer error)
+MIN_MATCHES = 12            # matches needed before even running RANSAC
+MIN_INLIERS_DIRECT = 15     # inliers needed to accept a direct estimate
+MIN_INLIERS_SEQ = 12        # inliers needed to accept a sequential estimate
+MIN_SPAN = (0.30, 0.20)     # inliers must spread over this fraction of the frame
+                            # (rejects scoreboard / logo clusters)
+AREA_RANGE = (0.05, 20.0)   # allowed warped-frame area / frame area
+GATE_PX = 60.0              # max disagreement direct vs sequential (px in reference)
+STRONG_INLIERS = 80         # a direct estimate this strong is trusted regardless
+GUIDED_RADIUS = 3.0         # px: window of the 2nd matching pass, around the pair's own H.
+                            # Keep it below RANSAC_THRESH: at 4 px, near-miss wrong matches
+                            # (3-3.5 px off) got in as inliers and biased 2 frames by ~6 px
+OVERLAY_SAMPLES = 40        # frames used to find the scoreboard / logos fixed on screen
 
+
+# ------------------------------------------------------------------------------
+# 1. DLT with Hartley normalisation
+# ------------------------------------------------------------------------------
 def normalize_points(pts):
     """
-    Hartley isotropic normalization of 2D points.
-    Translates centroid to origin and scales average distance to sqrt(2).
-    
-    Args:
-        pts: (N, 2) numpy array of 2D point coordinates.
-        
-    Returns:
-        pts_norm: (N, 2) normalized point coordinates.
-        T: (3, 3) similarity transformation matrix such that [x_norm, 1]^T = T * [x, 1]^T.
+    Hartley normalisation: move the centroid to the origin and scale so the
+    mean distance to the origin is sqrt(2).
+
+    Returns (pts_norm, T) with  [x_norm, 1]^T = T [x, 1]^T.
     """
     pts = np.asarray(pts, dtype=np.float64)
-    mean = np.mean(pts, axis=0)
+    mean = pts.mean(axis=0)
     centered = pts - mean
-    
     mean_dist = np.mean(np.sqrt(np.sum(centered ** 2, axis=1)))
-    if mean_dist < 1e-8:
-        scale = 1.0
-    else:
-        scale = np.sqrt(2.0) / mean_dist
-        
-    T = np.array([
-        [scale, 0.0,   -scale * mean[0]],
-        [0.0,   scale, -scale * mean[1]],
-        [0.0,   0.0,    1.0]
-    ], dtype=np.float64)
-    
-    pts_homo = np.column_stack((pts, np.ones(len(pts), dtype=np.float64)))
-    pts_norm = (T @ pts_homo.T).T[:, :2]
-    
-    return pts_norm, T
+    scale = np.sqrt(2.0) / mean_dist if mean_dist > 1e-8 else 1.0
+
+    T = np.array([[scale, 0.0,   -scale * mean[0]],
+                  [0.0,   scale, -scale * mean[1]],
+                  [0.0,   0.0,    1.0]])
+    return centered * scale, T
+
+
+def normalize_scale(H):
+    """Fix the arbitrary scale of H (H[2,2] = 1, or unit norm if that is ~0)."""
+    if abs(H[2, 2]) > 1e-10:
+        return H / H[2, 2]
+    n = np.linalg.norm(H)
+    return H / n if n > 1e-10 else H
 
 
 def dlt_homography(pts_src, pts_dst):
     """
-    Computes 3x3 homography H such that pts_dst ~ H * pts_src using
-    Hartley-normalized Direct Linear Transformation (DLT).
-    
-    Args:
-        pts_src: (N, 2) coordinates in source frame.
-        pts_dst: (N, 2) coordinates in target/reference frame.
-        
-    Returns:
-        H: (3, 3) homography matrix, or None if degenerate.
+    Direct Linear Transform:  pts_dst ~ H pts_src.
+
+    For one correspondence x=(x,y,1) -> x'=(u,v,1), the relation x' ~ H x means
+        u = (h1.x) / (h3.x)      v = (h2.x) / (h3.x)
+    where h1, h2, h3 are the rows of H. Cross-multiplying gives two equations
+    that are linear in the 9 entries of H:
+        -x*h11 - y*h12 - h13                    + u*x*h31 + u*y*h32 + u*h33 = 0
+                          -x*h21 - y*h22 - h23  + v*x*h31 + v*y*h32 + v*h33 = 0
+
+    Stacking N correspondences gives a (2N x 9) matrix A with A h = 0.
+    H has 8 degrees of freedom (the scale is free), so 4 correspondences give
+    8 equations and A has rank 8: its 1-D null space is H.  With more than 4
+    points the system is over-determined and the right singular vector of the
+    smallest singular value is the least-squares solution (min ||A h||, ||h||=1).
+
+    Returns the 3x3 matrix, or None if N < 4 or the SVD fails.
     """
     pts_src = np.asarray(pts_src, dtype=np.float64)
     pts_dst = np.asarray(pts_dst, dtype=np.float64)
-    N = pts_src.shape[0]
-    
+    N = len(pts_src)
     if N < 4:
         return None
-        
-    # 1. Normalize coordinates
-    pts_src_norm, T_src = normalize_points(pts_src)
-    pts_dst_norm, T_dst = normalize_points(pts_dst)
-    
-    # 2. Build 2N x 9 matrix A
-    A = np.zeros((2 * N, 9), dtype=np.float64)
+
+    # 1. normalise both point sets (conditioning)
+    src_n, T_src = normalize_points(pts_src)
+    dst_n, T_dst = normalize_points(pts_dst)
+
+    # 2. build A (2N x 9)
+    A = np.zeros((2 * N, 9))
     for i in range(N):
-        x, y = pts_src_norm[i, 0], pts_src_norm[i, 1]
-        u, v = pts_dst_norm[i, 0], pts_dst_norm[i, 1]
-        
-        # Row 2*i: [-x, -y, -1,  0,  0,  0,  u*x,  u*y,  u]
-        A[2 * i] = [-x, -y, -1.0, 0.0, 0.0, 0.0, u * x, u * y, u]
-        # Row 2*i+1: [ 0,  0,  0, -x, -y, -1,  v*x,  v*y,  v]
+        x, y = src_n[i]
+        u, v = dst_n[i]
+        A[2 * i]     = [-x, -y, -1.0, 0.0, 0.0, 0.0, u * x, u * y, u]
         A[2 * i + 1] = [0.0, 0.0, 0.0, -x, -y, -1.0, v * x, v * y, v]
-        
-    # 3. Solve Ah = 0 via SVD
+
+    # 3. solve A h = 0.  full_matrices=True (default) matters when N = 4:
+    #    A is 8x9, and the 9th right-singular vector is the null vector.
     try:
         _, _, Vt = np.linalg.svd(A)
     except np.linalg.LinAlgError:
         return None
-        
-    h_norm = Vt[-1, :]
-    H_norm = h_norm.reshape(3, 3)
-    
-    # 4. Denormalize: H = inv(T_dst) * H_norm * T_src
-    try:
-        T_dst_inv = np.linalg.inv(T_dst)
-        H = T_dst_inv @ H_norm @ T_src
-    except np.linalg.LinAlgError:
-        return None
-        
-    # Normalize homography scale
-    if abs(H[2, 2]) > 1e-10:
-        H /= H[2, 2]
-    else:
-        norm = np.linalg.norm(H)
-        if norm > 1e-10:
-            H /= norm
-            
-    return H
+    H_norm = Vt[-1].reshape(3, 3)
+
+    # 4. undo the normalisation:  H = T_dst^-1  H_norm  T_src
+    H = np.linalg.inv(T_dst) @ H_norm @ T_src
+    return normalize_scale(H)
 
 
-# ==============================================================================
-# 2. Geometric Validation and Degeneracy Checks
-# ==============================================================================
-
-def are_points_collinear(p1, p2, p3, eps=1e-4):
-    """
-    Checks if 3 2D points are collinear by measuring triangle area.
-    """
-    area = 0.5 * abs((p2[0] - p1[0]) * (p3[1] - p1[1]) - (p2[1] - p1[1]) * (p3[0] - p1[0]))
-    return area < eps
-
-
-def is_sample_degenerate(pts_src_4, pts_dst_4):
-    """
-    Checks if any triplet of 4 correspondences is collinear in either source or destination.
-    """
-    triplets = [(0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)]
-    for i, j, k in triplets:
-        if are_points_collinear(pts_src_4[i], pts_src_4[j], pts_src_4[k]):
-            return True
-        if are_points_collinear(pts_dst_4[i], pts_dst_4[j], pts_dst_4[k]):
-            return True
-    return False
-
-
-def is_homography_valid(H, min_det=1e-5, max_cond=1e6):
-    """
-    Validates that a homography represents a plausible transformation:
-    non-singular, reasonable condition number, and preserves orientation.
-    """
-    if H is None or not np.all(np.isfinite(H)):
-        return False
-    det = np.linalg.det(H)
-    if abs(det) < min_det:
-        return False
-    cond = np.linalg.cond(H)
-    if cond > max_cond:
-        return False
-    return True
-
-
-# ==============================================================================
-# 3. Projection and Reprojection Errors
-# ==============================================================================
-
-def project_points(H, pts):
-    """
-    Projects (N, 2) points using 3x3 homography H.
-    
-    Returns:
-        projected_pts: (N, 2) projected coordinates.
-        valid_mask: (N,) boolean mask indicating points in front of the camera plane (w > 0).
-    """
+# ------------------------------------------------------------------------------
+# 2. Projection, errors, validity checks
+# ------------------------------------------------------------------------------
+def apply_homography(H, pts):
+    """Project (N,2) points with H. Points that map to infinity become NaN."""
     pts = np.asarray(pts, dtype=np.float64)
-    N = len(pts)
-    pts_homo = np.column_stack((pts, np.ones(N, dtype=np.float64)))
-    proj_homo = (H @ pts_homo.T).T
-    
-    w = proj_homo[:, 2]
-    valid_mask = np.abs(w) > 1e-8
-    
-    proj_pts = np.zeros_like(pts)
-    proj_pts[valid_mask, 0] = proj_homo[valid_mask, 0] / w[valid_mask]
-    proj_pts[valid_mask, 1] = proj_homo[valid_mask, 1] / w[valid_mask]
-    
-    return proj_pts, valid_mask
+    ph = np.column_stack([pts, np.ones(len(pts))]) @ H.T
+    w = ph[:, 2]
+    out = np.full((len(pts), 2), np.nan)
+    ok = np.abs(w) > 1e-12
+    out[ok] = ph[ok, :2] / w[ok, None]
+    return out
 
 
 def symmetric_transfer_error(H, pts_src, pts_dst):
     """
-    Computes symmetric transfer distance for each correspondence:
-    d(pts_dst, H * pts_src)^2 + d(pts_src, H^-1 * pts_dst)^2
+    Per-correspondence error (pixels):
+        sqrt( 0.5 * ( |dst - H src|^2 + |src - H^-1 dst|^2 ) )
+    Invalid points get +inf.
     """
-    N = len(pts_src)
-    errors = np.full(N, np.inf, dtype=np.float64)
-    
     try:
         H_inv = np.linalg.inv(H)
     except np.linalg.LinAlgError:
-        return errors
-        
-    # Forward projection: pts_src -> pts_dst
-    proj_dst, valid_dst = project_points(H, pts_src)
-    # Backward projection: pts_dst -> pts_src
-    proj_src, valid_src = project_points(H_inv, pts_dst)
-    
-    valid = valid_dst & valid_src
-    if not np.any(valid):
-        return errors
-        
-    fwd_sq = np.sum((pts_dst[valid] - proj_dst[valid]) ** 2, axis=1)
-    bwd_sq = np.sum((pts_src[valid] - proj_src[valid]) ** 2, axis=1)
-    
-    errors[valid] = np.sqrt(0.5 * (fwd_sq + bwd_sq))
-    return errors
+        return np.full(len(pts_src), np.inf)
+
+    fwd = np.sum((apply_homography(H, pts_src) - pts_dst) ** 2, axis=1)
+    bwd = np.sum((apply_homography(H_inv, pts_dst) - pts_src) ** 2, axis=1)
+    err = np.sqrt(0.5 * (fwd + bwd))
+    err[~np.isfinite(err)] = np.inf
+    return err
 
 
-# ==============================================================================
-# 4. Non-linear Homography Refinement
-# ==============================================================================
+def is_valid_homography(H):
+    """Finite, invertible and not absurdly ill-conditioned."""
+    return (H is not None and np.all(np.isfinite(H))
+            and abs(np.linalg.det(H)) > 1e-12
+            and np.linalg.cond(H) < 1e10)
 
-def refine_homography_nonlinear(H_init, pts_src, pts_dst):
+
+def is_sample_degenerate(src4, dst4, tol=1e-3):
     """
-    Refines homography parameters using Levenberg-Marquardt non-linear least squares
-    minimizing symmetric reprojection error.
+    True if any 3 of the 4 points are (nearly) collinear in the source or the
+    destination. The triangle area is measured relative to the squared spread
+    of the 4 points, so the test does not depend on units (pixels or metres).
     """
-    if len(pts_src) < 4:
-        return H_init
-        
-    # Parameterize H by 8 degrees of freedom (normalized by H[2,2])
-    H = H_init / (H_init[2, 2] if abs(H_init[2, 2]) > 1e-10 else 1.0)
-    params0 = H.flatten()[:8]
-    
-    def residuals(params):
-        H_mat = np.append(params, 1.0).reshape(3, 3)
-        err = symmetric_transfer_error(H_mat, pts_src, pts_dst)
-        err[~np.isfinite(err)] = 1e4
-        return np.clip(err, 0.0, 100.0)
-        
+    for pts in (src4, dst4):
+        scale = max(np.ptp(pts[:, 0]), np.ptp(pts[:, 1]))
+        if scale < 1e-9:
+            return True
+        for i, j, k in combinations(range(4), 3):
+            area = 0.5 * abs((pts[j, 0] - pts[i, 0]) * (pts[k, 1] - pts[i, 1])
+                             - (pts[j, 1] - pts[i, 1]) * (pts[k, 0] - pts[i, 0]))
+            if area / scale ** 2 < tol:
+                return True
+    return False
+
+
+def is_plausible(H, w, h):
+    """
+    Sanity check for a frame->reference homography: the frame rectangle must
+    land on a convex, non-mirrored quadrilateral of reasonable size.
+    """
+    corners = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float64)
+    if not is_valid_homography(H):
+        return False
+    ph = np.column_stack([corners, np.ones(4)]) @ H.T
+    if not (np.all(ph[:, 2] > 1e-12) or np.all(ph[:, 2] < -1e-12)):
+        return False                        # corners on both sides of the horizon
+    q = ph[:, :2] / ph[:, 2:3]
+
+    # convexity: all consecutive edge cross-products have the same sign
+    edges = np.roll(q, -1, axis=0) - q
+    cross = edges[:, 0] * np.roll(edges, -1, axis=0)[:, 1] \
+        - edges[:, 1] * np.roll(edges, -1, axis=0)[:, 0]
+    if not np.all(cross > 0):               # > 0 also rules out mirroring
+        return False
+
+    area = 0.5 * np.sum(q[:, 0] * np.roll(q[:, 1], -1) - np.roll(q[:, 0], -1) * q[:, 1])
+    ratio = area / (w * h)
+    return AREA_RANGE[0] <= ratio <= AREA_RANGE[1]
+
+
+# ------------------------------------------------------------------------------
+# 3. Non-linear refinement
+# ------------------------------------------------------------------------------
+def refine_homography(H0, pts_src, pts_dst):
+    """
+    Levenberg-Marquardt on the symmetric transfer error. The residual vector
+    holds the x and y components of both the forward and backward errors
+    (4N values), so the cost is smooth. Used on RANSAC inliers only.
+    The result is kept only if the mean error actually decreases.
+    """
+    if len(pts_src) < 4 or abs(H0[2, 2]) < 1e-10:
+        return H0
+    H0 = normalize_scale(H0)
+
+    def residuals(p):
+        H = np.append(p, 1.0).reshape(3, 3)
+        try:
+            H_inv = np.linalg.inv(H)
+        except np.linalg.LinAlgError:
+            return np.full(4 * len(pts_src), 1e3)
+        r = np.concatenate([(apply_homography(H, pts_src) - pts_dst).ravel(),
+                            (apply_homography(H_inv, pts_dst) - pts_src).ravel()])
+        r[~np.isfinite(r)] = 1e3
+        return r
+
     try:
-        res = least_squares(residuals, params0, method="lm", max_nfev=50)
-        if res.success:
-            H_refined = np.append(res.x, 1.0).reshape(3, 3)
-            if is_homography_valid(H_refined):
-                return H_refined / H_refined[2, 2]
+        res = least_squares(residuals, H0.ravel()[:8], method="lm",
+                            x_scale="jac", max_nfev=200)
     except Exception:
-        pass
-        
-    return H_init
+        return H0
+
+    H = np.append(res.x, 1.0).reshape(3, 3)
+    if not is_valid_homography(H):
+        return H0
+    before = np.mean(symmetric_transfer_error(H0, pts_src, pts_dst))
+    after = np.mean(symmetric_transfer_error(H, pts_src, pts_dst))
+    return H if after < before else H0
 
 
-# ==============================================================================
-# 5. RANSAC Homography Estimation
-# ==============================================================================
-
-def ransac_homography(pts_src, pts_dst, max_iters=2500, threshold=3.0, min_inliers=10, rng=None):
+# ------------------------------------------------------------------------------
+# 4. RANSAC
+# ------------------------------------------------------------------------------
+def ransac_homography(pts_src, pts_dst, max_iters=2000, threshold=3.0,
+                      min_inliers=10, confidence=0.995, rng=None):
     """
-    RANSAC estimator for 2D homography.
-    
-    Args:
-        pts_src: (N, 2) correspondences in source frame.
-        pts_dst: (N, 2) correspondences in target frame.
-        max_iters: maximum RANSAC sampling iterations.
-        threshold: inlier reprojection error threshold in pixels.
-        min_inliers: minimum number of inliers required for acceptance.
-        rng: optional np.random.Generator or RandomState.
-        
-    Returns:
-        best_H: (3, 3) estimated homography or None if failed.
-        inlier_mask: (N,) boolean mask of consensus inliers.
+    RANSAC for a homography.
+
+    Loop:
+        1. draw a minimal sample of 4 correspondences
+        2. reject it if 3 of the points are collinear
+        3. fit H with the DLT
+        4. score H: inliers are the points with symmetric transfer error < threshold
+        5. keep the model with the most inliers (ties: smaller total error)
+        6. shrink the number of iterations needed:
+               N = log(1 - confidence) / log(1 - w^4),  w = inlier ratio so far
+    Finally H is re-estimated with the DLT on all inliers, refined with LM, and
+    the inliers are recomputed with the final H.
+
+    Returns (H, inlier_mask). H is None if fewer than `min_inliers` inliers
+    were found.
     """
     pts_src = np.asarray(pts_src, dtype=np.float64)
     pts_dst = np.asarray(pts_dst, dtype=np.float64)
     N = len(pts_src)
-    
-    if N < 4:
-        return None, np.zeros(N, dtype=bool)
-        
+    no_inliers = np.zeros(N, dtype=bool)
+    if N < max(4, min_inliers):
+        return None, no_inliers
+
     if rng is None:
-        rng = np.random.default_rng(42)
-        
-    best_H = None
-    best_inlier_mask = np.zeros(N, dtype=bool)
-    max_inliers = 0
-    best_error_sum = np.inf
-    
-    # Adaptive iterations
-    confidence = 0.995
-    iters = 0
-    max_adaptive_iters = max_iters
-    
-    while iters < max_adaptive_iters:
-        iters += 1
-        
-        # 1. Sample minimal 4 correspondences
-        idx = rng.choice(N, size=4, replace=False)
-        sample_src = pts_src[idx]
-        sample_dst = pts_dst[idx]
-        
-        # 2. Check collinearity degeneracy
-        if is_sample_degenerate(sample_src, sample_dst):
+        rng = np.random.default_rng(42)          # fixed seed: reproducible runs
+
+    best_mask, best_n, best_cost = no_inliers, 0, np.inf
+    n_iters = max_iters
+    it = 0
+    while it < n_iters:
+        it += 1
+
+        idx = rng.choice(N, size=4, replace=False)          # 1. sample
+        if is_sample_degenerate(pts_src[idx], pts_dst[idx]):  # 2. degeneracy
             continue
-            
-        # 3. Fit minimal candidate model
-        H_cand = dlt_homography(sample_src, sample_dst)
-        if H_cand is None or not is_homography_valid(H_cand):
+        H = dlt_homography(pts_src[idx], pts_dst[idx])        # 3. fit
+        if not is_valid_homography(H):
             continue
-            
-        # 4. Score model against all points
-        errors = symmetric_transfer_error(H_cand, pts_src, pts_dst)
-        inlier_mask = errors < threshold
-        num_inliers = np.sum(inlier_mask)
-        
-        if num_inliers > max_inliers or (num_inliers == max_inliers and np.sum(errors[inlier_mask]) < best_error_sum):
-            max_inliers = num_inliers
-            best_error_sum = np.sum(errors[inlier_mask])
-            best_inlier_mask = inlier_mask
-            best_H = H_cand
-            
-            # Update adaptive iteration bound
-            w = max_inliers / float(N)
-            w4 = w ** 4
-            if w4 >= 0.999:
-                max_adaptive_iters = min(max_adaptive_iters, iters + 10)
-            elif w4 > 1e-12:
-                denom = np.log(1.0 - w4)
-                if abs(denom) > 1e-12:
-                    N_est = np.log(1.0 - confidence) / denom
-                    max_adaptive_iters = min(max_adaptive_iters, int(np.ceil(N_est)))
-                
-    # 5. Consensus check and refinement on all inliers
-    if max_inliers >= max(4, min_inliers):
-        # Re-estimate DLT on all consensus inliers
-        inlier_src = pts_src[best_inlier_mask]
-        inlier_dst = pts_dst[best_inlier_mask]
-        H_refined = dlt_homography(inlier_src, inlier_dst)
-        
-        if H_refined is not None and is_homography_valid(H_refined):
-            # Non-linear refinement
-            H_refined = refine_homography_nonlinear(H_refined, inlier_src, inlier_dst)
-            return H_refined, best_inlier_mask
-            
-    return best_H, best_inlier_mask
+
+        err = symmetric_transfer_error(H, pts_src, pts_dst)   # 4. score
+        mask = err < threshold
+        n_in = int(mask.sum())
+        cost = float(err[mask].sum())
+
+        if n_in > best_n or (n_in == best_n and cost < best_cost):   # 5. keep best
+            best_mask, best_n, best_cost = mask, n_in, cost
+
+            w = n_in / N                                            # 6. adapt
+            if w ** 4 >= 1.0:
+                n_iters = min(n_iters, it)
+            elif w ** 4 > 1e-12:
+                needed = np.log(1.0 - confidence) / np.log(1.0 - w ** 4)
+                n_iters = min(n_iters, int(np.ceil(needed)))
+
+    if best_n < min_inliers:
+        return None, best_mask
+
+    # final least-squares fit on all inliers, then non-linear refinement
+    src_in, dst_in = pts_src[best_mask], pts_dst[best_mask]
+    H = dlt_homography(src_in, dst_in)
+    if not is_valid_homography(H):
+        return None, best_mask
+    H = refine_homography(H, src_in, dst_in)
+
+    mask = symmetric_transfer_error(H, pts_src, pts_dst) < threshold
+    if mask.sum() < min_inliers:
+        return None, mask
+    return H, mask
 
 
-# ==============================================================================
-# 6. Feature Loading and Matching (SciPy cKDTree)
-# ==============================================================================
+# ------------------------------------------------------------------------------
+# 5. Features, matching and I/O  [membro 2]
+# ------------------------------------------------------------------------------
+# Features are tuples (pts (N,2) float64 [x, y], des (N,128) float32), as before.
+# Matches go cur -> ref: src = cur pts, dst = ref pts, and the homography is H @ src ~ dst.
+
+IMG_EXTS = (".jpg", ".jpeg", ".png")
+
+
+def rootsift(des, eps=1e-12):
+    """
+    RootSIFT (Arandjelovic & Zisserman 2012): L1-normalise, then square root.
+    Euclidean distance between RootSIFT vectors is the Hellinger distance between
+    the original histograms, which compares SIFT descriptors better than plain L2.
+    The result has unit L2 norm, so distances lie in [0, sqrt(2)].
+    """
+    des = np.asarray(des, dtype=np.float32)
+    if len(des) == 0:
+        return des
+    des = np.maximum(des, 0)
+    return np.sqrt(des / (des.sum(axis=1, keepdims=True) + eps))
+
 
 def load_feature_mat(mat_path):
     """
-    Loads SIFT features stored in .mat format as defined by pivist/features:
-    Dictionary containing 'kp' of shape (130, N):
-        - row 0: x coordinates
-        - row 1: y coordinates
-        - rows 2..129: 128-dimensional SIFT descriptors
-        
-    Returns:
-        pts: (N, 2) numpy array of keypoint locations [x, y].
-        des: (N, 128) numpy array of SIFT descriptors.
+    Load 'kp' of shape (130, N) from a feature .mat file (pivist/features format):
+    row 0 = x, row 1 = y, rows 2..129 = SIFT descriptor.
+    Returns pts (N,2) and RootSIFT descriptors (N,128).
+    Copes with empty files (frames with no keypoints), a transposed matrix and the
+    zero padding the VisionIST box adds when kp[i] is saved whole.
     """
     data = sio.loadmat(mat_path)
     if "kp" not in data:
-        raise KeyError(f"Feature file {mat_path} does not contain 'kp' key.")
-        
-    combined = data["kp"]
-    if combined.shape[0] < 130 and combined.shape[1] >= 130:
-        # Transposed format safeguard
-        combined = combined.T
-        
-    pts = combined[0:2, :].T.astype(np.float64)  # (N, 2)
-    des = combined[2:, :].T.astype(np.float32)   # (N, 128)
-    
-    # Normalize descriptors to unit L2 norm
-    norms = np.linalg.norm(des, axis=1, keepdims=True)
-    norms[norms < 1e-7] = 1.0
-    des = des / norms
-    
-    return pts, des
+        raise KeyError(f"{mat_path} has no 'kp' entry")
+    kp = np.asarray(data["kp"])
+    if kp.size == 0:
+        return np.zeros((0, 2)), np.zeros((0, 128), np.float32)
+    if kp.shape[0] != 130 and kp.ndim == 2 and kp.shape[1] == 130:
+        kp = kp.T
+    if kp.shape[0] != 130:
+        raise ValueError(f"{mat_path}: expected kp with 130 rows, got {kp.shape}")
+    pts = kp[:2, :].T.astype(np.float64)
+    des = kp[2:, :].T.astype(np.float32)
+    keep = des.any(axis=1)                   # all-zero rows are padding, not keypoints
+    return pts[keep], rootsift(des[keep])
 
 
-def match_sift_features(pts1, des1, pts2, des2, ratio_thresh=0.75, mutual_check=True):
+def _knn2_brute(qa, db, chunk=2048):
     """
-    Matches SIFT descriptors using Lowe's ratio test and mutual consistency
-    using scipy.spatial.cKDTree.
-    
-    Returns:
-        matched_pts1: (M, 2) matched points in set 1.
-        matched_pts2: (M, 2) matched points in set 2.
+    Two nearest neighbours in db of every row of qa (exact, by matrix product in
+    blocks), plus the nearest row of qa for every row of db (for the mutual check).
+    In 128-D this is ~7x faster than cKDTree and gives the same answer.
     """
-    N1 = len(des1)
-    N2 = len(des2)
-    if N1 < 4 or N2 < 4:
-        return np.empty((0, 2)), np.empty((0, 2))
-        
-    # Build KD-Tree on target descriptors
-    tree2 = cKDTree(des2)
-    dists, indices = tree2.query(des1, k=2, workers=-1)
-    
-    # Lowe's ratio test
-    ratio_mask = dists[:, 0] < (ratio_thresh * dists[:, 1])
-    
-    if not mutual_check:
-        valid_idx1 = np.where(ratio_mask)[0]
-        valid_idx2 = indices[valid_idx1, 0]
-        return pts1[valid_idx1], pts2[valid_idx2]
-        
-    # Mutual cross-check: query 1-NN of des2 in des1
-    tree1 = cKDTree(des1)
-    _, rev_indices = tree1.query(des2, k=1, workers=-1)
-    
-    valid_idx1 = []
-    valid_idx2 = []
-    for i1 in np.where(ratio_mask)[0]:
-        i2 = indices[i1, 0]
-        if rev_indices[i2] == i1:
-            valid_idx1.append(i1)
-            valid_idx2.append(i2)
-            
-    valid_idx1 = np.array(valid_idx1, dtype=int)
-    valid_idx2 = np.array(valid_idx2, dtype=int)
-    
-    return pts1[valid_idx1], pts2[valid_idx2]
-
-
-# ==============================================================================
-# 7. Court Model Anchoring
-# ==============================================================================
-
-def load_or_compute_court_anchor(refdir):
-    """
-    Loads court model anchoring to compute H_ref_to_court (Frame 0 pixels -> court meters).
-    
-    1. Loads metric court model from `courtmodel.mat` in refdir (contains 'pts' in meters).
-    2. Matches with image keypoints from `court_base_*.mat` or `court_keypoints.mat` in refdir.
-    3. Solves H_ref_to_court using Hartley-normalized DLT from scratch.
-    """
-    court_model_path = os.path.join(refdir, "courtmodel.mat")
-    court_pts = None
-    H_precomputed = None
-
-    if os.path.exists(court_model_path):
-        try:
-            cm = sio.loadmat(court_model_path)
-            if "pts" in cm:
-                court_pts = cm["pts"].astype(np.float64)
-            if "H_ref_to_court" in cm:
-                H_precomputed = cm["H_ref_to_court"].astype(np.float64)
-        except Exception as e:
-            print(f"[part1] Notice reading courtmodel.mat: {e}")
-
-    if H_precomputed is not None and is_homography_valid(H_precomputed):
-        print("[part1] Loaded precomputed anchor H_ref_to_court from courtmodel.mat.")
-        return H_precomputed
-
-    # Search for image keypoints file: court_base_*.mat, court_keypoints.mat, anchor.mat
-    kps_candidates = glob.glob(os.path.join(refdir, "court_base_*.mat"))
-    kps_candidates.extend([
-        os.path.join(refdir, "court_keypoints.mat"),
-        os.path.join(refdir, "anchor.mat")
-    ])
-
-    for cand in kps_candidates:
-        if not os.path.exists(cand):
-            continue
-        try:
-            data = sio.loadmat(cand)
-            if "H_ref_to_court" in data:
-                H_anc = data["H_ref_to_court"].astype(np.float64)
-                if is_homography_valid(H_anc):
-                    print(f"[part1] Loaded H_ref_to_court from {os.path.basename(cand)}.")
-                    return H_anc
-
-            img_pts = None
-            if "img_pts" in data:
-                img_pts = data["img_pts"].astype(np.float64)
-            elif "points" in data:
-                img_pts = data["points"].astype(np.float64)
-
-            # If candidate also provides court_pts, use them; otherwise use courtmodel.mat pts
-            target_court_pts = data["court_pts"].astype(np.float64) if "court_pts" in data else court_pts
-
-            if img_pts is not None and target_court_pts is not None and len(img_pts) == len(target_court_pts):
-                H_anc = dlt_homography(img_pts, target_court_pts)
-                if H_anc is not None and is_homography_valid(H_anc):
-                    if abs(H_anc[2, 2]) > 1e-10:
-                        H_anc /= H_anc[2, 2]
-                    print(f"[part1] Computed H_ref_to_court from {os.path.basename(cand)} and courtmodel.mat via DLT.")
-                    return H_anc
-        except Exception as e:
-            print(f"[part1] Notice reading {cand}: {e}")
-
-    print("[part1] Warning: No court landmark correspondences found in refdir.")
-    print("        Using identity matrix for H_ref_to_court until anchor is provided.")
-    return np.eye(3, dtype=np.float64)
-
-
-# ==============================================================================
-# 8. Main Tracking Function: part1(path1, path2, path3, path4)
-# ==============================================================================
-
-def part1(path1, path2, path3, path4):
-    """
-    Main entry point required by project specification:
-    part1(path_to_refdir, path_images_dir, path_feature_dir, path_output_dir)
-    
-    Computes for every frame in path_images_dir:
-    - H: (3, 3) homography from frame NNNN to reference image (templateimg.jpg).
-    - Hc: (3, 3) homography from frame NNNN to court model (court coordinates in meters).
-    Saves results to path_output_dir as homography_NNNN.mat.
-    """
-    path_to_refdir = path1
-    path_images_dir = path2
-    path_feature_dir = path3
-    path_output_dir = path4
-    
-    os.makedirs(path_output_dir, exist_ok=True)
-    
-    # 1. Load Anchor Homography (Reference Image -> Court Model)
-    H_ref_to_court = load_or_compute_court_anchor(path_to_refdir)
-    
-    # 2. Locate Reference Feature File
-    # Check for templateimg.mat in feature_dir or refdir
-    template_feat_path = os.path.join(path_feature_dir, "templateimg.mat")
-    if not os.path.exists(template_feat_path):
-        template_feat_path = os.path.join(path_to_refdir, "templateimg.mat")
-        
-    ref_pts, ref_des = None, None
-    if os.path.exists(template_feat_path):
-        ref_pts, ref_des = load_feature_mat(template_feat_path)
-        print(f"[part1] Loaded reference template features: {len(ref_pts)} keypoints.")
-    else:
-        print("[part1] Notice: templateimg.mat not found. Will initialize reference from first frame.")
-        
-    # 3. Discover and sort all sequence frames
-    # Pattern: somename_NNNN.ext
-    image_exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
-    image_files = []
-    for ext in image_exts:
-        image_files.extend(glob.glob(os.path.join(path_images_dir, ext)))
-        
-    if not image_files:
-        print(f"[part1] Error: No images found in {path_images_dir}!")
-        return
-        
-    # Sort frames naturally by sequential number
-    def extract_frame_info(fpath):
-        basename = os.path.basename(fpath)
-        name_no_ext = os.path.splitext(basename)[0]
-        match = re.search(r"(\d+)$", name_no_ext)
-        num = int(match.group(1)) if match else 0
-        num_str = match.group(1) if match else "0000"
-        return num, num_str, name_no_ext, fpath
-        
-    frame_list = sorted([extract_frame_info(f) for f in image_files], key=lambda x: x[0])
-    total_frames = len(frame_list)
-    print(f"[part1] Processing sequence of {total_frames} frames from {path_images_dir}...")
-    
-    # Tracking state
-    prev_pts, prev_des = None, None
-    H_prev = np.eye(3, dtype=np.float64)
-    last_valid_H = np.eye(3, dtype=np.float64)
-    
-    cut_count = 0
-    direct_success_count = 0
-    seq_success_count = 0
-    court_lost = False
-    
-    for idx, (frame_num, num_str, name_no_ext, img_path) in enumerate(frame_list):
-        # Locate corresponding feature .mat file
-        feat_path = os.path.join(path_feature_dir, f"{name_no_ext}.mat")
-        
-        curr_pts, curr_des = None, None
-        if os.path.exists(feat_path):
-            try:
-                curr_pts, curr_des = load_feature_mat(feat_path)
-            except Exception as e:
-                print(f"[part1] Frame {num_str}: failed reading feature file: {e}")
-                
-        # If reference was not set, set it to the first frame's features
-        if ref_pts is None and curr_pts is not None:
-            ref_pts, ref_des = curr_pts, curr_des
-            print(f"[part1] Initialized reference features from frame {num_str} ({len(ref_pts)} keypoints).")
-            
-        H_curr = None
-        method = "cut_fallback"
-        
-        # ----------------------------------------------------------------------
-        # Strategy A: Direct matching to Reference Template (Zero drift)
-        # ----------------------------------------------------------------------
-        if curr_des is not None and ref_des is not None and len(curr_des) >= 4:
-            m_curr, m_ref = match_sift_features(curr_pts, curr_des, ref_pts, ref_des, ratio_thresh=0.75)
-            if len(m_curr) >= 12:
-                H_direct, inliers = ransac_homography(m_curr, m_ref, threshold=3.5, min_inliers=10)
-                if H_direct is not None and is_homography_valid(H_direct):
-                    # Check spatial spread: reject static broadcast graphics / scoreboard clusters
-                    inlier_pts = m_curr[inliers]
-                    ref_w = max(float(np.ptp(ref_pts[:, 0])), 100.0)
-                    ref_h = max(float(np.ptp(ref_pts[:, 1])), 100.0)
-                    span_x = float(np.ptp(inlier_pts[:, 0])) / ref_w
-                    span_y = float(np.ptp(inlier_pts[:, 1])) / ref_h
-
-                    if span_x >= 0.30 and span_y >= 0.20 and np.sum(inliers) >= 15:
-                        # Check that determinant is positive and condition is healthy
-                        if np.linalg.det(H_direct) > 0.05 and np.linalg.cond(H_direct) < 5e4:
-                            H_curr = H_direct
-                            method = f"direct (inliers: {np.sum(inliers)}/{len(m_curr)})"
-                            direct_success_count += 1
-                            court_lost = False
-                        
-        # ----------------------------------------------------------------------
-        # Strategy B: Frame-to-frame tracking composition (For camera pan/motion)
-        # Only active when court was visible in previous frame (not during cuts/closeups)
-        # ----------------------------------------------------------------------
-        if not court_lost and H_curr is None and curr_des is not None and prev_des is not None and len(curr_des) >= 4:
-            m_curr, m_prev = match_sift_features(curr_pts, curr_des, prev_pts, prev_des, ratio_thresh=0.75)
-            if len(m_curr) >= 10:
-                H_rel, inliers = ransac_homography(m_curr, m_prev, threshold=3.5, min_inliers=8)
-                if H_rel is not None and is_homography_valid(H_rel):
-                    inlier_pts = m_curr[inliers]
-                    prev_w = max(float(np.ptp(prev_pts[:, 0])), 100.0)
-                    prev_h = max(float(np.ptp(prev_pts[:, 1])), 100.0)
-                    span_x = float(np.ptp(inlier_pts[:, 0])) / prev_w
-                    span_y = float(np.ptp(inlier_pts[:, 1])) / prev_h
-
-                    if span_x >= 0.30 and span_y >= 0.20:
-                        H_comp = H_prev @ H_rel
-                        if is_homography_valid(H_comp):
-                            H_curr = H_comp / H_comp[2, 2]
-                            method = f"sequential (inliers: {np.sum(inliers)}/{len(m_curr)})"
-                            seq_success_count += 1
-                        
-        # ----------------------------------------------------------------------
-        # Strategy C: Cut / Occlusion / Absent Court Handling
-        # ----------------------------------------------------------------------
-        if H_curr is None:
-            # Replay / close-up / court out of view: propagate last valid homography
-            H_curr = last_valid_H.copy()
-            method = "cut/lost fallback (propagated last valid)"
-            cut_count += 1
-            court_lost = True
+    na, nb = len(qa), len(db)
+    idx = np.full((na, 2), -1, dtype=np.int64)
+    dist = np.full((na, 2), np.inf, dtype=np.float32)
+    col_d = np.full(nb, np.inf, dtype=np.float32)
+    col_i = np.full(nb, -1, dtype=np.int64)
+    db_sq = np.einsum("ij,ij->i", db, db)
+    cols = np.arange(nb)
+    for s in range(0, na, chunk):
+        q = qa[s:s + chunk]
+        d2 = np.einsum("ij,ij->i", q, q)[:, None] + db_sq[None, :] - 2.0 * (q @ db.T)
+        np.maximum(d2, 0.0, out=d2)
+        rows = np.arange(len(q))
+        if nb >= 2:
+            part = np.argpartition(d2, 1, axis=1)[:, :2]
+            pd = d2[rows[:, None], part]
+            order = np.argsort(pd, axis=1)
+            idx[s:s + len(q)] = np.take_along_axis(part, order, 1)
+            dist[s:s + len(q)] = np.take_along_axis(pd, order, 1)
         else:
-            last_valid_H = H_curr.copy()
-            court_lost = False
-            # Only update previous court keypoints when court is confirmed visible
-            if curr_pts is not None:
-                prev_pts, prev_des = curr_pts, curr_des
-                H_prev = H_curr.copy()
-            
-        # ----------------------------------------------------------------------
-        # Compute Metric Court Homography: Hc = H_ref_to_court @ H
-        # ----------------------------------------------------------------------
-        Hc = H_ref_to_court @ H_curr
-        if abs(Hc[2, 2]) > 1e-10:
-            Hc = Hc / Hc[2, 2]
-            
-        # Save output homography: homography_NNNN.mat
-        out_mat_filename = f"homography_{num_str}.mat"
-        out_mat_path = os.path.join(path_output_dir, out_mat_filename)
-        
-        out_dict = {
-            "H": H_curr.astype(np.float64),
-            "Hc": Hc.astype(np.float64)
-        }
-        sio.savemat(out_mat_path, out_dict)
-        
-        if (idx + 1) % 20 == 0 or (idx + 1) == total_frames:
-            print(f"[part1] Processed frame {idx + 1}/{total_frames} ({num_str}) -> {method}")
-            
-    print(f"\n[part1] Completed Part 1 tracking for {total_frames} frames.")
-    print(f"        Direct matches:     {direct_success_count}")
-    print(f"        Sequential matches: {seq_success_count}")
-    print(f"        Cuts / Fallbacks:   {cut_count}")
-    print(f"        Results saved to:   {path_output_dir}")
+            idx[s:s + len(q), 0] = 0
+            dist[s:s + len(q), 0] = d2[:, 0]
+        cm = d2.argmin(axis=0)
+        cd = d2[cm, cols]
+        better = cd < col_d
+        col_d[better] = cd[better]
+        col_i[better] = cm[better] + s
+    return idx, np.sqrt(dist), col_i
+
+
+def _unique_targets(i1, i2, d):
+    """Sort by distance and keep at most one match per target index."""
+    order = np.argsort(d, kind="stable")
+    i1, i2, d = i1[order], i2[order], d[order]
+    _, first = np.unique(i2, return_index=True)
+    first.sort()
+    return i1[first], i2[first], d[first]
+
+
+def match_descriptors(des1, des2, ratio_thresh=RATIO_THRESH, mutual_check=True):
+    """
+    Global matching: Lowe's ratio test (d1 < ratio * d2) and, optionally, the mutual
+    check (i1 must also be the nearest neighbour of its match). Returns indices
+    (i1, i2) and distances.
+    """
+    empty = np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros(0, np.float32)
+    if len(des1) == 0 or len(des2) == 0:
+        return empty
+    idx, dist, back = _knn2_brute(des1, des2)
+    i1 = np.arange(len(des1))
+    keep = dist[:, 0] < ratio_thresh * dist[:, 1]            # ratio test
+    if mutual_check:
+        keep &= back[idx[:, 0]] == i1                        # 2->1 must agree
+    return _unique_targets(i1[keep], idx[keep, 0], dist[keep, 0])
+
+
+def match_sift_features(pts1, des1, pts2, des2, ratio_thresh=RATIO_THRESH,
+                        mutual_check=True):
+    """Same interface as before: returns the matched points of both sets."""
+    if len(des1) < 4 or len(des2) < 4:
+        return np.empty((0, 2)), np.empty((0, 2))
+    i1, i2, _ = match_descriptors(des1, des2, ratio_thresh, mutual_check)
+    return pts1[i1], pts2[i2]
+
+
+def match_guided(pts1, des1, pts2, des2, H_pred, radius=GUIDED_RADIUS,
+                 ratio_thresh=RATIO_THRESH, max_candidates=16):
+    """
+    Guided matching: point i of set 1 may only match points of set 2 that lie within
+    `radius` pixels of H_pred(i). Inside that window the ratio test only compares
+    plausible candidates, so the repeated court lines (whose second neighbour is
+    another identical corner) are no longer thrown away.
+
+    H_pred must be GOOD (error well below `radius`): use the H of the same frame
+    pair (see match_two_pass). With a stale prediction, e.g. the previous frame's H
+    while the camera moves ~30 px/frame, the window misses the true match and picks
+    wrong neighbours that are all pulled towards the prediction: a false consensus
+    that RANSAC may accept (25-60 px errors in the synthetic test).
+    """
+    empty = np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros(0, np.float32)
+    if len(des1) == 0 or len(des2) == 0 or H_pred is None:
+        return empty
+    pred = apply_homography(H_pred, pts1)
+    valid = np.flatnonzero(np.isfinite(pred).all(axis=1))
+    if len(valid) == 0:
+        return empty
+    k = int(min(max_candidates, len(pts2)))
+    _, cand = cKDTree(pts2).query(pred[valid], k=k, distance_upper_bound=radius, workers=-1)
+    cand = np.asarray(cand).reshape(len(valid), k)
+    missing = cand >= len(pts2)                               # no neighbour inside the radius
+    has_any = ~missing[:, 0]
+    valid, cand, missing = valid[has_any], cand[has_any], missing[has_any]
+    if len(valid) == 0:
+        return empty
+
+    a = des1[valid][:, None, :]                               # (n,1,128)
+    b = des2[np.where(missing, 0, cand)]                      # (n,k,128)
+    d = np.sqrt(np.maximum(((a - b) ** 2).sum(-1), 0)).astype(np.float32)
+    d[missing] = np.inf
+    order = np.argsort(d, axis=1)
+    rows = np.arange(len(valid))
+    d1 = d[rows, order[:, 0]]
+    d2 = d[rows, order[:, 1]] if k >= 2 else np.full(len(valid), np.inf, np.float32)
+    keep = d1 < ratio_thresh * d2                             # one candidate only: d2 = inf
+    return _unique_targets(valid[keep], cand[rows[keep], order[keep, 0]], d1[keep])
+
+
+def match_two_pass(cur, ref, estimate, min_matches=MIN_MATCHES):
+    """
+    Two-pass matching (guided matching, Hartley & Zisserman):
+        1. global matching -> estimate -> H0
+        2. guided matching in a GUIDED_RADIUS window around H0 of this same pair
+           -> estimate -> H1 (kept only if it has at least as many inliers as H0)
+    estimate(src, dst) -> (H or None, inlier_mask).
+    Returns (H, inliers, src, dst); H is None if the first pass fails.
+    """
+    (p1, d1), (p2, d2) = cur, ref
+    i1, i2, _ = match_descriptors(d1, d2)
+    if len(i1) < min_matches:
+        return None, np.zeros(len(i1), bool), p1[i1], p2[i2]
+    src, dst = p1[i1], p2[i2]
+    H0, inl0 = estimate(src, dst)
+    if H0 is None:
+        return None, inl0, src, dst
+
+    j1, j2, _ = match_guided(p1, d1, p2, d2, H0)
+    if len(j1) >= min_matches:
+        H1, inl1 = estimate(p1[j1], p2[j2])
+        if H1 is not None and inl1.sum() >= inl0.sum():
+            return H1, inl1, p1[j1], p2[j2]
+    return H0, inl0, src, dst
+
+
+def find_static_overlay(ref, feature_paths, size=None, n_samples=OVERLAY_SAMPLES,
+                        still_px=1.5, moved_px=4.0, min_moved_frac=0.3,
+                        min_hits=3, min_frac=0.6, cell=16):
+    """
+    Find the image regions that do NOT move with the camera (TV graphics: scoreboard,
+    channel logo). Their matches all agree with H = identity, so they can win RANSAC
+    when the court has few features, and on a cut to another camera they give a
+    "perfect" match (105 false inliers per cut frame in the synthetic test).
+
+    On ~n_samples frames spread over the sequence, match globally to the reference.
+    In a frame where the camera moved (at least min_moved_frac of the matches moved
+    more than moved_px), a reference keypoint that stayed put (< still_px) scores a
+    hit. It is an overlay if it has >= min_hits hits and stayed put in >= min_frac
+    of the moving-camera frames where it was matched. If the camera never moves,
+    nothing is marked (and then the identity is right anyway).
+
+    Returns a grid mask {"cell", "grid", "n_keypoints"} for drop_masked().
+    """
+    pts, des = ref
+    if size is None:
+        size = (int(pts[:, 0].max()) + 1, int(pts[:, 1].max()) + 1) if len(pts) else (1, 1)
+    w, h = size
+    grid = np.zeros((int(np.ceil(h / cell)), int(np.ceil(w / cell))), bool)
+    mask = {"cell": cell, "grid": grid, "n_keypoints": 0}
+    if len(pts) == 0 or len(feature_paths) == 0:
+        return mask
+
+    sample = np.unique(np.linspace(0, len(feature_paths) - 1,
+                                   min(n_samples, len(feature_paths))).round().astype(int))
+    hits = np.zeros(len(pts), int)
+    seen = np.zeros(len(pts), int)
+    for k in sample:
+        f_pts, f_des = try_load(feature_paths[k])
+        if f_des is None:
+            continue
+        i1, i2, _ = match_descriptors(f_des, des)
+        if len(i1) < 8:
+            continue
+        disp = np.linalg.norm(f_pts[i1] - pts[i2], axis=1)
+        if np.mean(disp > moved_px) < min_moved_frac:
+            continue                                          # camera still: no information
+        seen[i2] += 1
+        hits[i2[disp < still_px]] += 1
+    static = (hits >= min_hits) & (hits >= min_frac * np.maximum(seen, 1))
+
+    cx = np.clip((pts[static, 0] // cell).astype(int), 0, grid.shape[1] - 1)
+    cy = np.clip((pts[static, 1] // cell).astype(int), 0, grid.shape[0] - 1)
+    grid[cy, cx] = True
+    if grid.any():
+        grid = binary_closing(grid, iterations=2)             # merge the scoreboard letters
+        grid = binary_dilation(grid, iterations=1)
+    mask.update(grid=grid, n_keypoints=int(static.sum()))
+    return mask
+
+
+def drop_masked(feat, mask):
+    """Remove the keypoints that fall on marked cells of the overlay mask."""
+    pts, des = feat
+    if mask is None or des is None or len(pts) == 0 or not mask["grid"].any():
+        return feat
+    g, c = mask["grid"], mask["cell"]
+    cx = np.clip((pts[:, 0] // c).astype(int), 0, g.shape[1] - 1)
+    cy = np.clip((pts[:, 1] // c).astype(int), 0, g.shape[0] - 1)
+    keep = ~g[cy, cx]
+    return pts[keep], des[keep]
+
+
+def image_size(path):
+    """(width, height) of a JPEG or PNG, read from the header only (no cv2 / PIL)."""
+    with open(path, "rb") as f:
+        head = f.read(26)
+        if head[:8] == b"\x89PNG\r\n\x1a\n":
+            w, h = struct.unpack(">II", head[16:24])
+            return int(w), int(h)
+        if head[:2] != b"\xff\xd8":
+            raise ValueError(f"{path}: unsupported image format")
+        f.seek(2)
+        while True:
+            byte = f.read(1)
+            while byte and byte != b"\xff":
+                byte = f.read(1)
+            while byte == b"\xff":
+                byte = f.read(1)
+            if not byte:
+                raise ValueError(f"{path}: JPEG without SOF marker")
+            marker = byte[0]
+            if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+                continue
+            seg_len = struct.unpack(">H", f.read(2))[0]
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                _, h, w = struct.unpack(">BHH", f.read(5))
+                return int(w), int(h)
+            f.seek(seg_len - 2, 1)
+
+
+def list_frames(images_dir):
+    """[(number, number_string, name_without_ext)] sorted by frame number.
+    number_string keeps the leading zeros, so the output NNNN matches the input."""
+    frames = []
+    for f in os.listdir(images_dir):
+        if not f.lower().endswith(IMG_EXTS):
+            continue
+        name = os.path.splitext(f)[0]
+        m = re.search(r"(\d+)$", name)
+        if m:
+            frames.append((int(m.group(1)), m.group(1), name))
+        else:
+            print(f"[part1] ignoring {f}: no frame number at the end of the name")
+    return sorted(frames)
+
+
+def try_load(path, mask=None):
+    """(pts, des) of a feature file, without overlay keypoints; (None, None) if missing."""
+    if not os.path.exists(path):
+        return None, None
+    try:
+        return drop_masked(load_feature_mat(path), mask)
+    except Exception as e:
+        print(f"[part1] could not read {path}: {e}")
+        return None, None
+
+
+def save_homography(out_dir, num_str, H, Hc):
+    """out_dir/homography_NNNN.mat = {"H": (3,3), "Hc": (3,3)}, float64, H[2,2] = 1."""
+    H = normalize_scale(np.asarray(H, dtype=np.float64).reshape(3, 3))
+    Hc = np.asarray(Hc, dtype=np.float64).reshape(3, 3)
+    if np.all(np.isfinite(Hc)):
+        Hc = normalize_scale(Hc)
+    sio.savemat(os.path.join(out_dir, f"homography_{num_str}.mat"), {"H": H, "Hc": Hc})
+
+
+def missing_outputs(out_dir, frames):
+    """Frames with no homography_NNNN.mat. Must be empty at the end of part1."""
+    return [name for _, num_str, name in frames
+            if not os.path.isfile(os.path.join(out_dir, f"homography_{num_str}.mat"))]
+
+
+# ------------------------------------------------------------------------------
+# 6. Court anchor
+# ------------------------------------------------------------------------------
+def _as_points(a):
+    a = np.asarray(a, dtype=np.float64)
+    return a.T if a.shape[0] == 2 and a.shape[1] != 2 else a
+
+
+def load_court_anchor(refdir, images_dir=None):
+    """
+    H_ref_to_court (reference-image pixels -> court metres), by DLT on landmarks.
+
+    Expects in refdir (or, for the landmark file, in the images directory):
+        courtmodel.mat    {"pts": (N,2) metres, "names": ...}
+        court_base*.mat   {"img_pts" (or "points"): (N,2) pixel positions of the same landmarks
+                           in templateimg.jpg}; an optional "court_pts" key
+                           overrides the model points (for a subset of landmarks)
+    Raises if the anchor cannot be built: a silent identity would make Hc garbage.
+    """
+    cm_path = os.path.join(refdir, "courtmodel.mat")
+    if not os.path.exists(cm_path):
+        raise FileNotFoundError(f"{cm_path} not found")
+    court_pts = _as_points(sio.loadmat(cm_path)["pts"])
+
+    base_files = []
+    for d in (refdir, images_dir):                    # README: either directory
+        if d:
+            base_files += sorted(glob.glob(os.path.join(d, "court_base*.mat")))
+    if not base_files:
+        raise FileNotFoundError(
+            f"No court_base*.mat in {refdir} or {images_dir}: the anchor needs "
+            "the pixel positions of the court landmarks in the reference image.")
+    base = sio.loadmat(base_files[0])
+    key = next((k for k in ("img_pts", "points") if k in base), None)
+    if key is None:
+        raise KeyError(f"{base_files[0]} has neither 'img_pts' nor 'points'")
+    img_pts = _as_points(base[key])
+    if "court_pts" in base:
+        court_pts = _as_points(base["court_pts"])
+
+    if img_pts.shape != court_pts.shape:
+        raise ValueError(f"Landmark count mismatch: image {img_pts.shape} vs court {court_pts.shape}")
+    ok = np.isfinite(img_pts).all(axis=1) & np.isfinite(court_pts).all(axis=1)
+    if not ok.all():                                  # detector missed some keypoints
+        print(f"[part1] Anchor: dropping {int((~ok).sum())} undetected landmark(s)")
+    img_pts, court_pts = img_pts[ok], court_pts[ok]
+    if len(img_pts) < 4:
+        raise ValueError(f"Need >= 4 valid landmark pairs, got {len(img_pts)}")
+
+    H = dlt_homography(img_pts, court_pts)
+    if not is_valid_homography(H):
+        raise ValueError("Court anchor DLT produced a degenerate homography")
+
+    rms_cm = 100 * np.sqrt(np.mean(np.sum((apply_homography(H, img_pts) - court_pts) ** 2, axis=1)))
+    print(f"[part1] Anchor from {os.path.basename(base_files[0])}: "
+          f"{len(img_pts)} landmarks, RMS residual {rms_cm:.1f} cm")
+    return H
+
+
+# ------------------------------------------------------------------------------
+# 7. Tracking helpers
+# ------------------------------------------------------------------------------
+def estimate_pair(cur, ref, extent, min_inliers):
+    """
+    Homography cur -> ref from two-pass SIFT matching + RANSAC.
+    Returns (H, n_inliers), or (None, 0) if matches are too few, RANSAC fails,
+    or the inliers are bunched in one place (scoreboard / logo).
+    """
+    if cur[1] is None or ref[1] is None:
+        return None, 0
+    estimate = lambda s, d: ransac_homography(s, d, threshold=RANSAC_THRESH,
+                                              min_inliers=min_inliers)
+    H, inl, src, _ = match_two_pass(cur, ref, estimate)          # [membro 2]
+    if H is None:
+        return None, 0
+    span = np.ptp(src[inl], axis=0) / extent
+    if span[0] < MIN_SPAN[0] or span[1] < MIN_SPAN[1]:
+        return None, 0
+    return H, int(inl.sum())
+
+
+def disagreement(Ha, Hb, w, h):
+    """Mean distance (reference pixels) between two homographies on 5 frame points."""
+    g = np.array([[0, 0], [w, 0], [w, h], [0, h], [w / 2, h / 2]], dtype=np.float64)
+    return float(np.mean(np.linalg.norm(apply_homography(Ha, g) - apply_homography(Hb, g), axis=1)))
+
+
+def frame_geometry(ref_pts, size=None):
+    """Frame size (from the template's header when known, else approximated from the
+    reference keypoints) and keypoint extent."""
+    if size is not None:
+        w, h = float(size[0]), float(size[1])
+    else:
+        w, h = float(ref_pts[:, 0].max()), float(ref_pts[:, 1].max())
+    extent = np.maximum(np.ptp(ref_pts, axis=0), 100.0) if len(ref_pts) else np.array([w, h])
+    return max(w, 1.0), max(h, 1.0), extent
+
+
+# ------------------------------------------------------------------------------
+# 8. Entry point
+# ------------------------------------------------------------------------------
+def part1(path1, path2, path3, path4, strategy="hybrid"):
+    """part1(path_to_refdir, path_images_dir, path_feature_dir, path_output_dir, strategy='hybrid')"""
+    refdir, images_dir, feat_dir, out_dir = path1, path2, path3, path4
+    os.makedirs(out_dir, exist_ok=True)
+
+    # [membro 2] Without the landmark file the old code raised here, before writing any
+    # output; the brief requires H and Hc for every frame. H is still computed and Hc
+    # is written as NaN: explicitly invalid rather than silently wrong. (membro 3 decides.)
+    try:
+        H_ref_to_court = load_court_anchor(refdir, images_dir)
+    except (FileNotFoundError, KeyError, ValueError) as e:
+        print(f"[part1] WARNING: no court anchor ({e})\n"
+              "        H is still computed for every frame; Hc is written as NaN.")
+        H_ref_to_court = None
+
+    frames = list_frames(images_dir)
+    if not frames:
+        raise FileNotFoundError(f"No NAME_NNNN.jpg images in {images_dir}")
+    print(f"[part1] {len(frames)} frames")
+    feat_paths = [os.path.join(feat_dir, f"{name}.mat") for _, _, name in frames]
+
+    # reference features (templateimg.mat); if absent, the first frame is the reference
+    ref = (None, None)
+    for d in (feat_dir, refdir):
+        ref = try_load(os.path.join(d, "templateimg.mat"))
+        if ref[0] is not None:
+            break
+    if ref[0] is None:                                    # first frame with features
+        ref = next((f for f in map(try_load, feat_paths) if f[0] is not None), (None, None))
+        print("[part1] no templateimg.mat: reference initialised from the first frame")
+
+    # [membro 2] true frame size from the template header, and the overlay filter
+    size = None
+    for ext in IMG_EXTS:
+        p = os.path.join(refdir, "templateimg" + ext)
+        if os.path.isfile(p):
+            try:
+                size = image_size(p)
+            except ValueError as e:
+                print(f"[part1] could not read the size of {p}: {e}")
+            break
+    overlay = None
+    if ref[0] is not None:
+        overlay = find_static_overlay(ref, feat_paths, size)
+        ref = drop_masked(ref, overlay)
+        print(f"[part1] overlay filter: {overlay['n_keypoints']} static reference keypoints "
+              f"removed, {len(ref[0])} left")
+    geometry = frame_geometry(ref[0], size) if ref[0] is not None else None
+
+    prev = None                       # features of the last frame with a valid H
+    H_prev = np.eye(3)                # its H
+    last_valid_H = np.eye(3)
+    log = []
+
+    for idx, (num, num_str, name) in enumerate(frames):
+        cur = try_load(os.path.join(feat_dir, f"{name}.mat"), overlay)
+        has_feat = cur[1] is not None
+
+        if ref[0] is None and has_feat:                   # first frame becomes the reference
+            ref = cur
+            geometry = frame_geometry(ref[0])
+            print(f"[part1] reference initialised from frame {num_str}")
+
+        method, n_in, H = "fallback", 0, None
+
+        if has_feat and ref[0] is not None:
+            w, h, extent = geometry
+
+            # --- sequential: last good frame -> current, composed with its H
+            H_seq = None
+            if prev is not None:
+                H_rel, n_seq = estimate_pair(cur, prev, extent, MIN_INLIERS_SEQ)
+                if H_rel is not None:
+                    cand = normalize_scale(H_prev @ H_rel)
+                    if is_plausible(cand, w, h):
+                        H_seq = cand
+
+            # --- direct: current -> reference
+            H_dir, n_dir = estimate_pair(cur, ref, extent, MIN_INLIERS_DIRECT)
+            if H_dir is not None and not is_plausible(H_dir, w, h):
+                H_dir = None
+
+            # --- choose based on strategy
+            if strategy == "direct":
+                if H_dir is not None:
+                    H, method, n_in = H_dir, "direct", n_dir
+            elif strategy == "sequential":
+                if prev is None:
+                    H = H_dir if H_dir is not None else np.eye(3)
+                    method, n_in = "sequential", n_dir if H_dir is not None else 0
+                elif H_seq is not None:
+                    H, method, n_in = H_seq, "sequential", n_seq
+            else:  # "hybrid"
+                if H_dir is not None and H_seq is not None:
+                    if n_dir >= STRONG_INLIERS or disagreement(H_dir, H_seq, w, h) <= GATE_PX:
+                        H, method, n_in = H_dir, "direct", n_dir
+                    else:
+                        H, method, n_in = H_seq, "sequential", n_seq
+                elif H_dir is not None:
+                    H, method, n_in = H_dir, "direct", n_dir
+                elif H_seq is not None:
+                    H, method, n_in = H_seq, "sequential", n_seq
+
+        if H is None:                                     # cut / close-up / crowd
+            H = last_valid_H.copy()
+        else:
+            last_valid_H = H.copy()
+            prev, H_prev = cur, H.copy()
+
+        Hc = H_ref_to_court @ H if H_ref_to_court is not None else np.full((3, 3), np.nan)
+        save_homography(out_dir, num_str, H, Hc)
+        log.append({"frame": num, "method": method, "inliers": n_in})
+
+        if (idx + 1) % 50 == 0 or idx + 1 == len(frames):
+            print(f"[part1] {idx + 1}/{len(frames)}  frame {num_str}: {method} ({n_in} inliers)")
+
+    with open(os.path.join(out_dir, "tracking_log.json"), "w") as f:
+        json.dump(log, f)
+
+    counts = {m: sum(1 for e in log if e["method"] == m) for m in ("direct", "sequential", "fallback")}
+    print(f"[part1] done: {counts}  -> {out_dir}")
+
+    missing = missing_outputs(out_dir, frames)
+    if missing:
+        raise RuntimeError(f"no homography written for {len(missing)} frames: {missing[:5]}")
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Part 1: Planar tracking & homography estimation")
+    parser.add_argument("refdir", help="Path to reference directory (courtmodel.mat, templateimg.jpg)")
+    parser.add_argument("images_dir", help="Path to image sequence folder")
+    parser.add_argument("feat_dir", help="Path to SIFT features folder")
+    parser.add_argument("out_dir", help="Output directory for homography_NNNN.mat")
+    parser.add_argument("--strategy", choices=["hybrid", "direct", "sequential"], default="hybrid",
+                        help="Tracking strategy: hybrid (default), direct, or sequential")
+    args = parser.parse_args()
+    part1(args.refdir, args.images_dir, args.feat_dir, args.out_dir, strategy=args.strategy)
