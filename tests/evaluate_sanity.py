@@ -4,12 +4,15 @@ evaluate_sanity.py - Genuine Appendix A Self-Consistency Evaluation for Part 1.
 Implements all 6 evaluation checks strictly as defined in Appendix A of the project PDF:
 1. Line Reprojection Error: Warps court lines into frame i; measures perpendicular distance
    to nearest detected white-court-line pixels in the broadcast image.
-2. Cycle Consistency: Estimates independent pairwise homographies for triplets (i, j, k)
-   via SIFT matching, measures RMS displacement of a grid through H(k,i) @ H(j,k) @ H(i,j).
-3. Forward-Backward Consistency: Pure consecutive frame-to-frame sequential tracking from
-   0 to N and back to 0 without referencing frame 0; measures cumulative drift of court corners.
-4. Temporal Smoothness: Projects court corners across all frames and computes frame-to-frame
-   velocity; real camera motion is smooth, with spikes only at broadcast cuts.
+2. Cycle Consistency: for triplets (i, j, k) at baselines of 1-30 frames, a grid goes through
+   the output track i -> j -> k (H_j^-1 H_i, H_k^-1 H_j) and back k -> i through an independent
+   estimate (part1's own estimator); RMS displacement from the identity, by baseline. The
+   all-independent cycle is reported next to it (estimator noise alone).
+3. Forward-Backward Consistency: frame-to-frame composition s -> N -> s on the longest run of
+   frames with a court (no cut inside); drift of the court corners. Also the drift of the
+   forward chain from part1's output at N (what a purely sequential tracker would carry).
+4. Temporal Smoothness: court-corner velocity between consecutive frames that both have a
+   valid Hc (NaN "no_court" frames break the curve); spikes must coincide with re-anchors.
 5. Metric Residual: Maps detected court points to meters via Hc and measures known physical
    distances against official ITF dimensions.
 6. Warped-Court IoU: Compares the warped court model polygon against the independently detected
@@ -20,6 +23,7 @@ Usage:
 """
 
 import os
+import re
 import sys
 import glob
 import json
@@ -82,27 +86,6 @@ OFFICIAL_LINES_M = [
     ((0.0, -ITF_SERVICE_DIST),                      (0.0,  ITF_SERVICE_DIST)),                       # center service
     ((-ITF_DOUBLES_WIDTH / 2.0, 0.0),               ( ITF_DOUBLES_WIDTH / 2.0, 0.0))                 # net line
 ]
-
-
-# ==============================================================================
-# Helper: Load Feature Keypoints
-# ==============================================================================
-def load_features_for_frame(feat_dir, frame_idx):
-    """Loads SIFT keypoints and descriptors for a given frame index."""
-    patterns = [
-        os.path.join(feat_dir, f"frame_{frame_idx:04d}.mat"),
-        os.path.join(feat_dir, f"{frame_idx:04d}.mat")
-    ]
-    for p in patterns:
-        if os.path.exists(p):
-            try:
-                m = sio.loadmat(p)["kp"]
-                pts = m[:2, :].T.astype(np.float64)
-                des = m[2:, :].T.astype(np.float32)
-                return pts, des
-            except Exception:
-                pass
-    return None, None
 
 
 # ==============================================================================
@@ -179,171 +162,197 @@ def compute_line_reprojection_error(image_bgr, Hc, lines_m=OFFICIAL_LINES_M, max
 
 
 # ==============================================================================
-# 2. Cycle Consistency (Genuine Independent Pairwise SIFT Estimation)
+# Helper: the tracker's own pairwise estimator
 # ==============================================================================
-def compute_independent_cycle_consistency(feat_dir, triplet, img_shape=(720, 1280)):
+CYCLE_BASELINES = (1, 5, 15, 30)   # frames between i, j and k
+CYCLE_TRIPLETS = 8                 # triplets per baseline, spread over the sequence
+FB_MAX_LEN = 150                   # frames of forward-backward composition
+
+
+def feature_names(feat_dir):
+    """{frame number string: feature file stem}, e.g. {"0042": "frame_0042"}."""
+    names = {}
+    for f in os.listdir(feat_dir):
+        stem, ext = os.path.splitext(f)
+        m = re.search(r"(\d+)$", stem)
+        if ext == ".mat" and m and stem != "templateimg":
+            names[m.group(1)] = stem
+    return names
+
+
+class PairEstimator:
     """
-    Computes genuine cycle consistency by independently estimating pairwise homographies
-    H(i,j), H(j,k), and H(k,i) from raw SIFT descriptors (WITHOUT referencing frame 0).
-    Measures RMS displacement of a test grid from the identity transformation.
+    Independent pairwise homographies H(i -> j) (frame i pixels -> frame j pixels) from
+    the same features and the same estimator as part1 (overlay filter, two-pass matching,
+    RANSAC, refinement), so a check measures the tracker's output, not another matcher.
     """
-    i, j, k = triplet
-    pi, di = load_features_for_frame(feat_dir, i)
-    pj, dj = load_features_for_frame(feat_dir, j)
-    pk, dk = load_features_for_frame(feat_dir, k)
 
-    if any(x is None for x in [pi, pj, pk]):
-        return np.nan
+    def __init__(self, feat_dir, stems, size=None):
+        self.paths = [os.path.join(feat_dir, f"{s}.mat") for s in stems]
+        ref = part1.try_load(os.path.join(feat_dir, "templateimg.mat"))
+        if ref[0] is None:
+            ref = part1.try_load(self.paths[0])
+        self.overlay = part1.find_static_overlay(ref, self.paths, size)
+        self.w, self.h, self.extent = part1.frame_geometry(ref[0], size)
+        self.cache = {}
 
-    # 1. H(i -> j)
-    mij_i, mij_j = part1.match_sift_features(pi, di, pj, dj)
-    if len(mij_i) < 8:
-        return np.nan
-    Hij, _ = part1.ransac_homography(mij_i, mij_j)
+    def H(self, i, j):
+        if (i, j) not in self.cache:
+            a = part1.try_load(self.paths[i], self.overlay)
+            b = part1.try_load(self.paths[j], self.overlay)
+            H, _ = part1.estimate_pair(a, b, self.extent, part1.MIN_INLIERS_SEQ)
+            self.cache[(i, j)] = H
+        return self.cache[(i, j)]
 
-    # 2. H(j -> k)
-    mjk_j, mjk_k = part1.match_sift_features(pj, dj, pk, dk)
-    if len(mjk_j) < 8:
-        return np.nan
-    Hjk, _ = part1.ransac_homography(mjk_j, mjk_k)
 
-    # 3. H(k -> i)
-    mki_k, mki_i = part1.match_sift_features(pk, dk, pi, di)
-    if len(mki_k) < 8:
-        return np.nan
-    Hki, _ = part1.ransac_homography(mki_k, mki_i)
+def grid_rms(H, w, h):
+    """RMS displacement (px) of a 20x20 grid over the central 70% of the frame under H."""
+    gx, gy = np.meshgrid(np.linspace(0.15 * w, 0.85 * w, 20), np.linspace(0.15 * h, 0.85 * h, 20))
+    pts = np.column_stack([gx.ravel(), gy.ravel()])
+    proj = part1.apply_homography(H, pts)
+    return float(np.sqrt(np.mean(np.sum((proj - pts) ** 2, axis=1))))
 
-    if any(H is None for H in [Hij, Hjk, Hki]):
-        return np.nan
 
-    # Composed loop: i -> j -> k -> i
-    H_cycle = Hki @ Hjk @ Hij
-    if abs(H_cycle[2, 2]) < 1e-10:
-        return np.nan
-    H_cycle /= H_cycle[2, 2]
-
-    # Evaluate on a uniform test grid in image coordinates
-    H_img, W_img = img_shape
-    grid_x, grid_y = np.meshgrid(
-        np.linspace(0.15 * W_img, 0.85 * W_img, 20),
-        np.linspace(0.15 * H_img, 0.85 * H_img, 20)
-    )
-    pts = np.column_stack([grid_x.ravel(), grid_y.ravel()])
-    pts_homo = np.column_stack([pts, np.ones(len(pts))])
-
-    proj = (H_cycle @ pts_homo.T).T
-    w = proj[:, 2]
-    valid = np.abs(w) > 1e-6
-    if not np.any(valid):
-        return np.nan
-
-    proj_pts = proj[valid, :2] / proj[valid, 2:3]
-    rms = np.sqrt(np.mean(np.sum((proj_pts - pts[valid]) ** 2, axis=1)))
-    return float(rms)
+def valid_runs(valid):
+    """[(start, end)] of the maximal runs of consecutive valid frames (end inclusive)."""
+    runs, s = [], None
+    for t, v in enumerate(list(valid) + [False]):
+        if v and s is None:
+            s = t
+        elif not v and s is not None:
+            runs.append((s, t - 1))
+            s = None
+    return runs
 
 
 # ==============================================================================
-# 3. Forward-Backward Consistency (Genuine Consecutive Sequential Tracking)
+# 2. Cycle Consistency (the output track, closed by an independent estimate)
 # ==============================================================================
-def compute_genuine_forward_backward_drift(feat_dir, corners_init, N=25):
+def compute_cycle_consistency(est, h_list, baselines=CYCLE_BASELINES, n_triplets=CYCLE_TRIPLETS):
     """
-    Composes consecutive frame-to-frame tracking from 0 -> N and back N -> 0
-    using pure sequential SIFT matches (WITHOUT resetting to frame 0).
-    Measures how far the 4 genuine court corners return from their starting positions.
+    For triplets (i, j, k) = (i, i+b, i+2b) inside one run of frames with a valid H:
+      * track:     H(k->i)_indep @ H(j->k)_track @ H(i->j)_track, where
+                   H(i->j)_track = H_j^-1 H_i comes from part1's output. The two track
+                   edges collapse to H_k^-1 H_i, so this is how far the output disagrees
+                   with an independent measurement of the same motion;
+      * estimator: H(k->i) H(j->k) H(i->j), all three independent (estimator noise only).
+    Returns {b: {"track": median RMS px, "estimator": median RMS px, "n": triplets}}.
+    A cycle of output homographies alone is the identity by construction, so it would
+    measure nothing.
     """
-    if corners_init is None or len(corners_init) == 0:
-        return np.nan, None
+    valid = [np.all(np.isfinite(H)) for H in h_list]
+    runs = valid_runs(valid)
+    out = {}
+    for b in baselines:
+        starts = [i for s, e in runs for i in range(s, e - 2 * b + 1)]
+        if not starts:
+            continue
+        picks = sorted({starts[p] for p in np.linspace(0, len(starts) - 1, min(n_triplets, len(starts))).round().astype(int)})
+        track, indep = [], []
+        for i in picks:
+            j, k = i + b, i + 2 * b
+            Hki = est.H(k, i)
+            if Hki is None:
+                continue
+            track.append(grid_rms(Hki @ np.linalg.inv(h_list[k]) @ h_list[i], est.w, est.h))
+            Hij, Hjk = est.H(i, j), est.H(j, k)
+            if Hij is not None and Hjk is not None:
+                indep.append(grid_rms(Hki @ Hjk @ Hij, est.w, est.h))
+        out[b] = {"track": float(np.median(track)) if track else None,
+                  "estimator": float(np.median(indep)) if indep else None,
+                  "n": len(track)}
+    return out
 
-    # 1. Forward Pass: 0 -> 1 -> 2 -> ... -> N
-    H_fwd = np.eye(3)
-    p_curr, d_curr = load_features_for_frame(feat_dir, 0)
-    if p_curr is None:
-        return np.nan, None
 
-    for t in range(N):
-        p_next, d_next = load_features_for_frame(feat_dir, t + 1)
-        if p_next is None:
-            break
-        m_c, m_n = part1.match_sift_features(p_curr, d_curr, p_next, d_next)
-        if len(m_c) < 8:
-            break
-        H_rel, _ = part1.ransac_homography(m_c, m_n)
+# ==============================================================================
+# 3. Forward-Backward Consistency (frame-to-frame composition over a court run)
+# ==============================================================================
+def compute_forward_backward(est, h_list, hc_list, max_len=FB_MAX_LEN):
+    """
+    On the longest run of frames with a valid H (no cut inside): compose frame-to-frame
+    estimates from its first frame s forward to t, then back to s, and measure how far
+    the court corners (or the frame corners, without an anchor) return from where they
+    started. Also reports how far the forward chain s -> t has drifted from part1's output
+    for the same frames (H_t^-1 H_s): the drift a purely sequential tracker would carry.
+    """
+    runs = valid_runs([np.all(np.isfinite(H)) for H in h_list])
+    if not runs:
+        return None
+    s, e = max(runs, key=lambda r: r[1] - r[0])
+    e = min(e, s + max_len)
+    if e <= s:
+        return None
+
+    Hc_s = hc_list[s]
+    if np.all(np.isfinite(Hc_s)):
+        corners = part1.apply_homography(np.linalg.inv(Hc_s), OFFICIAL_CORNERS_M)
+    else:
+        corners = np.array([[0, 0], [est.w, 0], [est.w, est.h], [0, est.h]], dtype=np.float64)
+
+    fwd, t, chain_drift = np.eye(3), s, []
+    while t < e:
+        H_rel = est.H(t, t + 1)
         if H_rel is None:
             break
-        H_fwd = H_rel @ H_fwd
-        H_fwd /= H_fwd[2, 2]
-        p_curr, d_curr = p_next, d_next
+        fwd = part1.normalize_scale(H_rel @ fwd)
+        t += 1
+        track = np.linalg.inv(h_list[t]) @ h_list[s]
+        chain_drift.append(float(np.mean(np.linalg.norm(
+            part1.apply_homography(fwd, corners) - part1.apply_homography(track, corners), axis=1))))
+    end = t
 
-    # 2. Backward Pass: N -> N-1 -> ... -> 0
-    H_bwd = np.eye(3)
-    for t in range(N, 0, -1):
-        p_prev, d_prev = load_features_for_frame(feat_dir, t - 1)
-        if p_prev is None:
-            break
-        m_c, m_p = part1.match_sift_features(p_curr, d_curr, p_prev, d_prev)
-        if len(m_c) < 8:
-            break
-        H_rel, _ = part1.ransac_homography(m_c, m_p)
+    bwd = np.eye(3)
+    while t > s:
+        H_rel = est.H(t, t - 1)
         if H_rel is None:
-            break
-        H_bwd = H_rel @ H_bwd
-        H_bwd /= H_bwd[2, 2]
-        p_curr, d_curr = p_prev, d_prev
+            return {"start": s, "end": end, "round_trip_px": None,
+                    "chain_vs_track_px": chain_drift[-1] if chain_drift else None, "chain_curve": chain_drift}
+        bwd = part1.normalize_scale(H_rel @ bwd)
+        t -= 1
 
-    H_loop = H_bwd @ H_fwd
-    if abs(H_loop[2, 2]) < 1e-10:
-        return np.nan, None
-    H_loop /= H_loop[2, 2]
-
-    homo = np.column_stack([corners_init, np.ones(len(corners_init))])
-    proj = (H_loop @ homo.T).T
-    pts_loop = proj[:, :2] / proj[:, 2:3]
-
-    drift_per_corner = np.linalg.norm(pts_loop - corners_init, axis=1)
-    return float(np.mean(drift_per_corner)), drift_per_corner
+    back = part1.apply_homography(bwd @ fwd, corners)
+    return {"start": s, "end": end,
+            "round_trip_px": float(np.mean(np.linalg.norm(back - corners, axis=1))),
+            "chain_vs_track_px": chain_drift[-1] if chain_drift else None,
+            "chain_curve": chain_drift}
 
 
 # ==============================================================================
 # 4. Temporal Smoothness
 # ==============================================================================
-def compute_temporal_smoothness(hc_matrices, corners_m=OFFICIAL_CORNERS_M, spike_thresh_px=15.0):
+def compute_temporal_smoothness(hc_matrices, methods=None, corners_m=OFFICIAL_CORNERS_M,
+                                spike_thresh_px=15.0, spike_factor=6.0):
     """
-    Projects court corners across all frames and computes frame-to-frame velocity.
-    Flags sudden velocity spikes corresponding to camera cuts.
+    Projects the court corners into every frame and measures their frame-to-frame
+    velocity, only between consecutive frames that both have a valid Hc (frames written
+    as NaN, "no_court", break the curve instead of looking perfectly still).
+    A spike is a velocity above max(spike_thresh_px, spike_factor x median). Spikes at a
+    re-anchor are expected; any other spike sits between two tracked frames and is an
+    isolated catastrophic estimate ("unexplained").
     """
-    homo_m = np.column_stack([corners_m, np.ones(len(corners_m))])
-    proj_corners = []
+    T = len(hc_matrices)
+    corners = np.full((T, len(corners_m), 2), np.nan)
+    for t, Hc in enumerate(hc_matrices):
+        if np.all(np.isfinite(Hc)):
+            corners[t] = part1.apply_homography(np.linalg.inv(Hc), corners_m)
 
-    for Hc in hc_matrices:
-        try:
-            Hc_inv = np.linalg.inv(Hc)
-            p = (Hc_inv @ homo_m.T).T
-            pts = p[:, :2] / p[:, 2:3]
-            proj_corners.append(pts)
-        except Exception:
-            proj_corners.append(np.full((len(corners_m), 2), np.nan))
+    velocities = np.mean(np.linalg.norm(corners[1:] - corners[:-1], axis=2), axis=1)  # NaN across gaps
+    finite = np.isfinite(velocities)
+    median = float(np.median(velocities[finite])) if finite.any() else np.nan
+    thresh = max(spike_thresh_px, spike_factor * median) if finite.any() else spike_thresh_px
+    spikes = [int(t) + 1 for t in np.where(finite & (velocities > thresh))[0]]
+    methods = methods or [None] * T
+    unexplained = [t for t in spikes if methods[t] != "reanchor" and methods[t - 1] != "reanchor"]
 
-    proj_corners = np.array(proj_corners)  # (T, 4, 2)
-    velocities = np.linalg.norm(proj_corners[1:] - proj_corners[:-1], axis=2)  # (T-1, 4)
-    mean_velocities = np.mean(velocities, axis=1)  # (T-1,)
-
-    # Detect spikes
-    spikes = np.where(mean_velocities > spike_thresh_px)[0]
-
-    # Clean velocities without spikes
-    valid_mask = mean_velocities <= spike_thresh_px
-    baseline_vel = mean_velocities[valid_mask] if np.any(valid_mask) else mean_velocities
-
-    stats = {
-        "velocities": mean_velocities,
-        "mean_velocity": float(np.nanmean(baseline_vel)),
-        "median_velocity": float(np.nanmedian(baseline_vel)),
-        "max_velocity": float(np.nanmax(mean_velocities)),
-        "spikes": [int(s) for s in spikes],
-        "n_spikes": len(spikes)
+    return {
+        "velocities": velocities,
+        "median_velocity": median,
+        "max_velocity": float(np.max(velocities[finite])) if finite.any() else np.nan,
+        "threshold": thresh,
+        "spikes": spikes,
+        "unexplained_spikes": unexplained,
+        "no_court_frames": int(sum(not np.all(np.isfinite(Hc)) for Hc in hc_matrices)),
     }
-    return stats
-
 
 # ==============================================================================
 # 5. Metric Residual
@@ -491,63 +500,57 @@ def run_all_sanity_checks(results_dir, images_dir=None, features_dir=None, ref_d
         line_status = "SKIPPED (No valid images found in --images)"
         print(f"      Line Reprojection Error: {line_status}")
 
+    # Pairwise estimator on the same features as part1 (cycle and forward-backward checks)
+    est = None
+    if features_dir and os.path.isdir(features_dir):
+        stems = feature_names(features_dir)
+        nums = [re.search(r"(\d+)\.mat$", f).group(1) for f in mat_files]
+        if all(n in stems for n in nums):
+            size = None
+            if images_dir and os.path.isdir(images_dir):
+                imgs = sorted(glob.glob(os.path.join(images_dir, "*.jpg")) + glob.glob(os.path.join(images_dir, "*.png")))
+                size = part1.image_size(imgs[0]) if imgs else None
+            est = PairEstimator(features_dir, [stems[n] for n in nums], size)
+
     # -------------------------------------------------------------------------
-    # 2. Cycle Consistency (Genuine Independent Pairwise SIFT Matching)
+    # 2. Cycle Consistency (output track closed by an independent estimate)
     # Requires: --features
     # -------------------------------------------------------------------------
-    print("\n[2/6] Evaluating Independent Pairwise Cycle Consistency...")
-    triplet_rms_list = []
-    if features_dir and os.path.exists(features_dir):
-        triplets = [
-            (10, 20, 30),
-            (30, 45, 60),
-            (60, 80, 100),
-            (100, 120, 140),
-            (140, 160, 180)
-        ]
-        for tr in triplets:
-            if max(tr) < T:
-                rms = compute_independent_cycle_consistency(features_dir, tr)
-                if not np.isnan(rms):
-                    triplet_rms_list.append(rms)
-
-    if len(triplet_rms_list) > 0:
-        med_cycle_rms = float(np.median(triplet_rms_list))
-        cycle_status = "PASS" if med_cycle_rms < 0.5 else "FAIL"
-        print(f"      Independent Triplet Cycle RMS:  {med_cycle_rms:.4f} px (Target: Sub-pixel < 0.5 px) -> {cycle_status}")
-    else:
-        med_cycle_rms = np.nan
-        cycle_status = "SKIPPED (No valid features found in --features)"
+    print("\n[2/6] Evaluating Cycle Consistency (track vs independent estimates)...")
+    med_cycle_rms, cycle_by_baseline = np.nan, {}
+    cycle_status = "SKIPPED (No matching features in --features)"
+    if est is not None:
+        cycle_by_baseline = compute_cycle_consistency(est, h_list)
+        for b, r in cycle_by_baseline.items():
+            tr = f"{r['track']:.3f}" if r["track"] is not None else "N/A"
+            es = f"{r['estimator']:.3f}" if r["estimator"] is not None else "N/A"
+            print(f"      baseline {b:>2} frames: track {tr} px, estimator only {es} px ({r['n']} triplets)")
+        nearest = cycle_by_baseline.get(min(cycle_by_baseline), {}) if cycle_by_baseline else {}
+        if nearest.get("track") is not None:
+            med_cycle_rms = nearest["track"]
+            cycle_status = "PASS" if med_cycle_rms < 1.0 else "FAIL"
+            print(f"      Nearby-frame track cycle RMS:   {med_cycle_rms:.4f} px (Target: Sub-pixel) -> {cycle_status}")
+    if np.isnan(med_cycle_rms):
         print(f"      Cycle Consistency: {cycle_status}")
 
     # -------------------------------------------------------------------------
-    # 3. Forward-Backward Consistency (Genuine Consecutive Sequential Tracking)
-    # Requires: --features and Frame 0 court corners
+    # 3. Forward-Backward Consistency (frame-to-frame composition on a court run)
+    # Requires: --features
     # -------------------------------------------------------------------------
-    print("\n[3/6] Measuring Pure Sequential Forward-Backward Drift...")
-    mean_drift = np.nan
-    drift_status = "SKIPPED (No valid features found in --features)"
-
-    # Compute genuine court corners in Frame 0 pixels from Hc_0
-    court_corners_0 = None
-    if len(hc_list) > 0 and hc_list[0] is not None:
-        try:
-            hc0_inv = np.linalg.inv(hc_list[0])
-            homo_m = np.column_stack([OFFICIAL_CORNERS_M, np.ones(len(OFFICIAL_CORNERS_M))])
-            p0 = (hc0_inv @ homo_m.T).T
-            court_corners_0 = p0[:, :2] / p0[:, 2:3]
-        except Exception:
-            court_corners_0 = None
-
-    if features_dir and os.path.exists(features_dir) and court_corners_0 is not None:
-        drift_val, _ = compute_genuine_forward_backward_drift(features_dir, court_corners_0, N=min(T - 1, 25))
-        if not np.isnan(drift_val):
-            mean_drift = drift_val
+    print("\n[3/6] Measuring Forward-Backward Drift of Frame-to-Frame Composition...")
+    mean_drift, fb = np.nan, None
+    drift_status = "SKIPPED (No matching features in --features)"
+    if est is not None:
+        fb = compute_forward_backward(est, h_list, hc_list)
+        if fb is not None and fb["round_trip_px"] is not None:
+            mean_drift = fb["round_trip_px"]
             drift_status = "PASS" if mean_drift < 5.0 else "FAIL"
-            print(f"      Composed Track Round-trip Drift: {mean_drift:.3f} px  (Target: Few px < 5.0 px) -> {drift_status}")
-        else:
-            print(f"      Forward-Backward Drift: {drift_status}")
-    else:
+            print(f"      Frames {fb['start']} -> {fb['end']} -> {fb['start']}: round trip {mean_drift:.3f} px "
+                  f"(Target: Few px < 5.0 px) -> {drift_status}")
+            if fb["chain_vs_track_px"] is not None:
+                print(f"      Forward chain vs part1 output at frame {fb['end']}: {fb['chain_vs_track_px']:.2f} px "
+                      f"(drift a purely sequential tracker would carry)")
+    if np.isnan(mean_drift):
         print(f"      Forward-Backward Drift: {drift_status}")
 
     # -------------------------------------------------------------------------
@@ -555,22 +558,37 @@ def run_all_sanity_checks(results_dir, images_dir=None, features_dir=None, ref_d
     # Requires: --results (always available)
     # -------------------------------------------------------------------------
     print("\n[4/6] Tracking Temporal Velocity & Flagging Broadcast Cuts...")
-    smoothness = compute_temporal_smoothness(hc_list)
+    methods = None
+    log_path = os.path.join(results_dir, "tracking_log.json")
+    if os.path.isfile(log_path):
+        log = json.load(open(log_path))
+        if len(log) == T:
+            methods = [e["method"] for e in log]
+    smoothness = compute_temporal_smoothness(hc_list, methods)
     med_vel = smoothness["median_velocity"]
-    smooth_status = "PASS" if med_vel < 2.0 else "FAIL"
-    print(f"      Median Corner Velocity:         {med_vel:.2f} px/frame (Target: < 2.0 px/frame) -> {smooth_status}")
-    print(f"      Flagged Broadcast Cut Spikes:   {len(smoothness['spikes'])} frames ({smoothness['spikes']})")
+    smooth_status = "PASS" if not smoothness["unexplained_spikes"] else "FAIL"
+    print(f"      Median Corner Velocity:         {med_vel:.2f} px/frame ({smoothness['no_court_frames']} "
+          f"no-court frames excluded)")
+    print(f"      Spikes (> {smoothness['threshold']:.1f} px/frame):         {smoothness['spikes']}")
+    print(f"      Unexplained spikes:             {smoothness['unexplained_spikes']} -> {smooth_status}")
 
     # Plot smoothness velocity profile
     if out_dir and plt is not None:
         plot_path = os.path.join(out_dir, "sanity_smoothness.png")
         plt.figure(figsize=(10, 4), dpi=150)
-        plt.plot(smoothness["velocities"], color="#1f77b4", linewidth=1.5, label="Corner Velocity (px/frame)")
+        frames_v = np.arange(1, len(smoothness["velocities"]) + 1)
+        plt.plot(frames_v, smoothness["velocities"], color="#1f77b4", linewidth=1.5, label="Corner Velocity (px/frame)")
+        if methods is not None:
+            nc = [t for t, m in enumerate(methods) if m == "no_court"]
+            if nc:
+                plt.scatter(nc, np.zeros(len(nc)), color="#999999", s=6, marker="|", label="No court (NaN)")
         if smoothness["spikes"]:
-            spike_indices = smoothness["spikes"]
-            spike_vals = [smoothness["velocities"][s] for s in spike_indices]
-            plt.scatter(spike_indices, spike_vals, color="red", s=40, zorder=5, label="Detected Cut / Discontinuity")
-        plt.axhline(y=15.0, color="gray", linestyle="--", alpha=0.7, label="Cut Threshold (15 px/frame)")
+            spike_vals = [smoothness["velocities"][s - 1] for s in smoothness["spikes"]]
+            colours = ["red" if s in smoothness["unexplained_spikes"] else "orange" for s in smoothness["spikes"]]
+            plt.scatter(smoothness["spikes"], spike_vals, color=colours, s=40, zorder=5,
+                        label="Spike (red: unexplained, orange: at a re-anchor)")
+        plt.axhline(y=smoothness["threshold"], color="gray", linestyle="--", alpha=0.7,
+                    label=f"Spike threshold ({smoothness['threshold']:.1f} px/frame)")
         plt.title("Temporal Smoothness Profile & Cut Discontinuity Detection", fontsize=12, fontweight="bold")
         plt.xlabel("Frame Index", fontsize=10)
         plt.ylabel("Court Corner Velocity (px/frame)", fontsize=10)
@@ -634,12 +652,17 @@ def run_all_sanity_checks(results_dir, images_dir=None, features_dir=None, ref_d
         "line_reprojection_error_px": med_line_err if not np.isnan(med_line_err) else None,
         "line_status": line_status,
         "cycle_consistency_rms_px": med_cycle_rms if not np.isnan(med_cycle_rms) else None,
+        "cycle_by_baseline": {str(b): r for b, r in cycle_by_baseline.items()},
         "cycle_status": cycle_status,
         "forward_backward_drift_px": mean_drift if not np.isnan(mean_drift) else None,
+        "forward_backward_frames": [fb["start"], fb["end"]] if fb else None,
+        "chain_vs_track_px": fb["chain_vs_track_px"] if fb else None,
         "drift_status": drift_status,
         "temporal_velocity_px_per_frame": med_vel,
         "smooth_status": smooth_status,
         "flagged_cut_frames": smoothness["spikes"],
+        "unexplained_spike_frames": smoothness["unexplained_spikes"],
+        "no_court_frames": smoothness["no_court_frames"],
         "metric_residual_cm": med_metric_cm if not np.isnan(med_metric_cm) else None,
         "metric_status": metric_status,
         "warped_court_iou": med_iou if not np.isnan(med_iou) else None,
@@ -695,16 +718,23 @@ def run_all_sanity_checks(results_dir, images_dir=None, features_dir=None, ref_d
             f.write("| Verification Metric | What it Catches | How it is Computed | Measured Value | What Good Looks Like | Result |\n")
             f.write("| :--- | :--- | :--- | :--- | :--- | :---: |\n")
             f.write(f"| **Line reprojection error** | Subtly wrong homography | Distance to nearest detected white-line pixels | `{v_line_md}` | Median under ~2-3 px at 720p | **{line_status}** |\n")
-            f.write(f"| **Cycle consistency** | Mutually inconsistent estimates | RMS displacement of grid through independent $H_{{ki}} H_{{jk}} H_{{ij}}$ | `{v_cycle_md}` | Sub-pixel for nearby frames | **{cycle_status}** |\n")
-            f.write(f"| **Forward-backward consistency** | Drift in composed track | Pure sequential tracking $0 \\to N \\to 0$ corner drift | `{v_drift_md}` | A few pixels over a rally | **{drift_status}** |\n")
-            f.write(f"| **Temporal smoothness** | Isolated catastrophic frames | Corner velocity profile across frames | `{med_vel:.2f} px/f` | Spikes only at flagged cuts | **{smooth_status}** |\n")
+            f.write(f"| **Cycle consistency** | Mutually inconsistent estimates | Grid RMS through $\\hat H_{{ki}} H_{{jk}} H_{{ij}}$ (output track closed by an independent estimate), nearest baseline | `{v_cycle_md}` | Sub-pixel for nearby frames | **{cycle_status}** |\n")
+            f.write(f"| **Forward-backward consistency** | Drift in composed track | Frame-to-frame composition $s \\to N \\to s$ on the longest court run, corner drift | `{v_drift_md}` | A few pixels over a rally | **{drift_status}** |\n")
+            f.write(f"| **Temporal smoothness** | Isolated catastrophic frames | Corner velocity between consecutive tracked frames; unexplained spikes: `{smoothness['unexplained_spikes']}` | `{med_vel:.2f} px/f` | Spikes only at flagged cuts | **{smooth_status}** |\n")
             f.write(f"| **Metric residual** | Valid projectively but wrong court | Landmark error mapped to official ITF dimensions | `{v_metric_md}` | Within a few centimetres | **{metric_status}** |\n")
             f.write(f"| **Warped-court IoU** | Gross misregistration | Polygon IoU vs detected court landmark hull | `{v_iou_md}` | Above 0.95 on clean frames | **{iou_status}** |\n\n")
-            f.write("## 2. Detected Broadcast Cuts\n\n")
-            if smoothness['spikes']:
-                f.write(f"Camera cuts / discontinuities cleanly detected at frames: `{smoothness['spikes']}`\n\n")
-            else:
-                f.write("No sudden camera discontinuities detected.\n\n")
+            f.write("## 2. Cycle Consistency by Baseline\n\n")
+            f.write("| Baseline (frames) | Track vs independent (px) | Estimator only (px) | Triplets |\n| ---: | ---: | ---: | ---: |\n")
+            for b, r in cycle_by_baseline.items():
+                tr = f"{r['track']:.3f}" if r["track"] is not None else "N/A"
+                es = f"{r['estimator']:.3f}" if r["estimator"] is not None else "N/A"
+                f.write(f"| {b} | {tr} | {es} | {r['n']} |\n")
+            if fb and fb["chain_vs_track_px"] is not None:
+                f.write(f"\nForward chain {fb['start']} -> {fb['end']} vs part1 output at frame {fb['end']}: "
+                        f"`{fb['chain_vs_track_px']:.2f} px` (drift of a purely sequential tracker).\n")
+            f.write("\n## 2b. Frames Without a Court and Spikes\n\n")
+            f.write(f"- No-court frames (NaN): {smoothness['no_court_frames']}\n")
+            f.write(f"- Velocity spikes: `{smoothness['spikes']}`; unexplained: `{smoothness['unexplained_spikes']}`\n\n")
             f.write("## 3. Smoothness Velocity Profile\n\n")
             f.write("![Temporal Smoothness Curve](sanity_smoothness.png)\n")
         print(f"\nSaved Markdown Report to: {md_path}")
