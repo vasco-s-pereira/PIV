@@ -4,14 +4,6 @@
   "line_reproj_median_px_clean": 0.0,
   "line_reproj_mean_px_clean": 0.7912806265611314,
   "metric_residual_median_cm_clean": 7.484034355576608,
-  "iou_frames": 0,
-  "iou_median": null,
-  "iou_min": null,
-  "targets": {
-    "line_reproj_px": "< 2-3",
-    "metric_residual_cm": "< 5",
-    "iou": "> 0.95"
-  },
   "reference_landmark_residual_cm": 18.382559898376762,
   "reference_landmark_residual_detail_cm": {
     "doubles_width": 0.5635916813943709,
@@ -20,5 +12,13 @@
     "baseline_separation": 20.22420420943476,
     "service_line_separation": 44.66437348509302,
     "service_to_baseline": 56.89334363490053
+  },
+  "iou_frames": 2,
+  "iou_median": 0.969374975929207,
+  "iou_min": 0.9584170510449973,
+  "targets": {
+    "line_reproj_px": "< 2-3",
+    "metric_residual_cm": "< 5",
+    "iou": "> 0.95"
   }
 }
